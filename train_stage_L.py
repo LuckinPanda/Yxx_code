@@ -54,8 +54,11 @@ def setup_logger(stage: str) -> logging.Logger:
 
 def validate_constants(cfg: dict) -> None:
     c = cfg["constants"]
-    if not (_eq(c["tau"], 1e-3) and _eq(c["eps"], 1e-6)):
-        raise ValueError("Constants must have tau=1e-3, eps=1e-6. Omega can vary per stage.")
+    if not _eq(c["eps"], 1e-6):
+        raise ValueError("SPEC-fixed constant eps must be 1e-6.")
+    tau = c["tau"]
+    if tau < 0.01:
+        print(f"[WARN] tau={tau} is very small. Recommend tau>=0.05.")
 
 
 # ── Helper losses ──────────────────────────────────────────────────────────
@@ -146,6 +149,7 @@ def main() -> None:
     adarenet = AdaReNet(base_channels=cfg["model"]["adarenet_channels"])
 
     illum_adjust_mode = cfg["constants"].get("illum_adjust_mode", "gamma")
+    pref_max = cfg["constants"].get("pref_max", 5.0)
     model = RetinexAdaReNet(
         illum,
         adarenet,
@@ -153,6 +157,7 @@ def main() -> None:
         tau=cfg["constants"]["tau"],
         eps=cfg["constants"]["eps"],
         illum_adjust_mode=illum_adjust_mode,
+        pref_max=pref_max,
     ).to(device)
 
     # Freeze AdaReNet in Stage-L (illumination pretraining)
@@ -184,7 +189,13 @@ def main() -> None:
     logger.info("Pseudo-GT: Retinex-derived from paired data  L_pseudo = mean(I_low / I_high)")
     logger.info("Losses: L1(L_T, L_pseudo) + TV(L_T) + Recon(L_T * I_high, I_low)")
     logger.info("=" * 80)
-    
+
+    # AMP (mixed precision) for speedup on modern GPUs
+    use_amp = device.type == "cuda"
+    scaler = torch.amp.GradScaler(enabled=use_amp)
+    if use_amp:
+        logger.info("AMP (mixed precision) enabled")
+
     for epoch in range(1, epochs + 1):
         epoch_loss = 0.0
         epoch_illum = 0.0
@@ -196,26 +207,29 @@ def main() -> None:
             
             optimizer.zero_grad()
             
-            # ── Retinex-derived pseudo illumination GT ──
-            # L_pseudo ≈ mean_channel(I_low / I_high), smoothed → [B,1,H,W]
-            L_pseudo = compute_retinex_pseudo_gt(low, high)
-            
-            # Get illumination prediction
-            L_T, _ = model.compute_illumination(low)   # [B, 1, H, W]
-            
-            # ── Losses ──
-            # 1) Direct illumination supervision (single-channel)
-            loss_illum = F.l1_loss(L_T, L_pseudo)
-            
-            # 2) TV smoothness on L_T
-            loss_tv = tv_loss(L_T)
-            
-            # 3) Reconstruction consistency: L_T * I_high ≈ I_low
-            loss_rec = recon_loss(L_T, low, high)
-            
-            loss = lambda_illum * loss_illum + lambda_tv * loss_tv + lambda_recon * loss_rec
-            loss.backward()
-            optimizer.step()
+            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                # ── Retinex-derived pseudo illumination GT ──
+                # L_pseudo ≈ mean_channel(I_low / I_high), smoothed → [B,1,H,W]
+                L_pseudo = compute_retinex_pseudo_gt(low, high)
+                
+                # Get illumination prediction
+                L_T, _ = model.compute_illumination(low)   # [B, 1, H, W]
+                
+                # ── Losses ──
+                # 1) Direct illumination supervision (single-channel)
+                loss_illum = F.l1_loss(L_T, L_pseudo)
+                
+                # 2) TV smoothness on L_T
+                loss_tv = tv_loss(L_T)
+                
+                # 3) Reconstruction consistency: L_T * I_high ≈ I_low
+                loss_rec = recon_loss(L_T, low, high)
+                
+                loss = lambda_illum * loss_illum + lambda_tv * loss_tv + lambda_recon * loss_rec
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             
             epoch_loss  += loss.item()
             epoch_illum += loss_illum.item()

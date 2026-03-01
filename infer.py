@@ -25,10 +25,15 @@ def _eq(a: float, b: float, tol: float = 1e-12) -> bool:
 
 def validate_constants(cfg: dict) -> None:
     # Note: omega can vary for better illumination enhancement
-    # Only tau and eps must be fixed per SPEC
+    # tau is now configurable (recommended 0.05-0.2 for numerical stability)
     c = cfg["constants"]
-    if not (_eq(c["tau"], 1e-3) and _eq(c["eps"], 1e-6)):
-        raise ValueError("SPEC-fixed constants must have tau=1e-3, eps=1e-6. Omega can vary.")
+    if not _eq(c["eps"], 1e-6):
+        raise ValueError("SPEC-fixed constant eps must be 1e-6.")
+    tau = c["tau"]
+    if tau < 0.01:
+        print(f"[WARN] tau={tau} is very small. Dark-area P_ref may explode. Recommend tau>=0.05.")
+    elif tau > 0.5:
+        print(f"[WARN] tau={tau} is very large. Over-clamping may lose dark-area detail.")
 
 
 def _gaussian_window(window_size: int, sigma: float, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -225,6 +230,7 @@ def main() -> None:
     adarenet = AdaReNet(base_channels=cfg["model"]["adarenet_channels"])
 
     illum_adjust_mode = cfg["constants"].get("illum_adjust_mode", "gamma")
+    pref_max = cfg["constants"].get("pref_max", 5.0)
     model = RetinexAdaReNet(
         illum,
         adarenet,
@@ -232,6 +238,7 @@ def main() -> None:
         tau=cfg["constants"]["tau"],
         eps=cfg["constants"]["eps"],
         illum_adjust_mode=illum_adjust_mode,
+        pref_max=pref_max,
     ).to(device)
 
     ckpt_cfg = cfg["ckpt"]

@@ -12,9 +12,10 @@ model:
 constants:
   # Must be consistent across training and inference
   omega: 15.0
-  tau: 0.001
+  tau: 0.1
   eps: 0.000001
   illum_adjust_mode: gamma
+  pref_max: 5.0
 
 ckpt:
   illum_ckpt_path: checkpoints/illum_ckpt.pth

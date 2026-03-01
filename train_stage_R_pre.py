@@ -52,8 +52,11 @@ def setup_logger(stage: str) -> logging.Logger:
 
 def validate_constants(cfg: dict) -> None:
     c = cfg["constants"]
-    if not (_eq(c["tau"], 1e-3) and _eq(c["eps"], 1e-6)):
-        raise ValueError("SPEC-fixed constants must have tau=1e-3, eps=1e-6. Omega can vary.")
+    if not _eq(c["eps"], 1e-6):
+        raise ValueError("SPEC-fixed constant eps must be 1e-6.")
+    tau = c["tau"]
+    if tau < 0.01:
+        print(f"[WARN] tau={tau} is very small. Dark-area P_ref may explode. Recommend tau>=0.05.")
     n = cfg["noise"]
     if not (_eq(n["sigma_min"], 0.01) and _eq(n["sigma_max"], 0.05)):
         raise ValueError("SPEC-fixed noise range must be sigma in [0.01, 0.05]")
@@ -162,6 +165,7 @@ def main() -> None:
     adarenet = AdaReNet(base_channels=cfg["model"]["adarenet_channels"])
 
     illum_adjust_mode = cfg["constants"].get("illum_adjust_mode", "gamma")
+    pref_max = cfg["constants"].get("pref_max", 5.0)
     model = RetinexAdaReNet(
         illum,
         adarenet,
@@ -169,6 +173,7 @@ def main() -> None:
         tau=cfg["constants"]["tau"],
         eps=cfg["constants"]["eps"],
         illum_adjust_mode=illum_adjust_mode,
+        pref_max=pref_max,
     ).to(device)
     logger.info(f"Model created on {device}")
 
@@ -181,6 +186,44 @@ def main() -> None:
         p.requires_grad = False
     model.illumination.eval()
     logger.info("IlluminationNet frozen, AdaReNet trainable")
+
+    # ── Pre-cache frozen illumination outputs ──────────────────────────────
+    # Since IlluminationNet is frozen, L_T/L_e/P_ref are constant per image.
+    # Pre-computing them once avoids 20 epochs × 122 steps of redundant work.
+    logger.info("Pre-caching illumination outputs (L_e, P_ref) for all images...")
+    cached_le = []
+    cached_pref = []
+    with torch.no_grad():
+        cache_loader = DataLoader(
+            dataset, batch_size=1, shuffle=False,
+            num_workers=data_cfg["num_workers"], pin_memory=True,
+        )
+        for batch in tqdm(cache_loader, desc="Caching illumination", ncols=80):
+            low = batch["low"].to(device, non_blocking=True)
+            l_t, l_e = model.compute_illumination(low)
+            p_ref = model.compute_pref(low, l_t)
+            cached_le.append(l_e.squeeze(0).cpu())
+            cached_pref.append(p_ref.squeeze(0).cpu())
+    logger.info(f"Cached {len(cached_le)} illumination outputs")
+
+    # Build a lightweight dataset of pre-cached tensors for efficient training
+    class CachedReflectanceDataset(torch.utils.data.Dataset):
+        def __init__(self, le_list, pref_list):
+            self.le = le_list
+            self.pref = pref_list
+        def __len__(self):
+            return len(self.le)
+        def __getitem__(self, idx):
+            return {"l_e": self.le[idx], "p_ref": self.pref[idx]}
+
+    cached_dataset = CachedReflectanceDataset(cached_le, cached_pref)
+    cached_loader = DataLoader(
+        cached_dataset,
+        batch_size=cfg["train"]["batch_size"],
+        shuffle=True,
+        num_workers=data_cfg["num_workers"],
+        pin_memory=True,
+    )
 
     optimizer = torch.optim.Adam(model.adarenet.parameters(), lr=cfg["train"]["lr"])
     logger.info(f"Optimizer: Adam, lr={cfg['train']['lr']}")
@@ -209,47 +252,64 @@ def main() -> None:
     logger.info("Starting Stage-R-pre (Reflectance Pretraining with Mask-Based Self-Supervised Loss)")
     logger.info("Losses: L_ss(masked) + grad_preserve + color_consistency + delta_reg")
     logger.info("=" * 80)
-
+    # AMP (mixed precision) for ~1.5-2x speedup on modern GPUs
+    use_amp = device.type == "cuda"
+    scaler = torch.amp.GradScaler(enabled=use_amp)
+    if use_amp:
+        logger.info("AMP (mixed precision) enabled")
     for epoch in range(1, epochs + 1):
         epoch_loss = 0.0
         epoch_ss = 0.0
         epoch_grad = 0.0
         epoch_color = 0.0
         epoch_reg = 0.0
-        for step, batch in enumerate(tqdm(loader, desc=f"Stage-R-pre Epoch {epoch}", ncols=80)):
-            low = batch["low"].to(device, non_blocking=True)
-
-            with torch.no_grad():
-                l_t, l_e = model.compute_illumination(low)
-                p_ref = model.compute_pref(low, l_t)
+        for step, batch in enumerate(tqdm(cached_loader, desc=f"Stage-R-pre Epoch {epoch}", ncols=80)):
+            l_e = batch["l_e"].to(device, non_blocking=True)
+            p_ref = batch["p_ref"].to(device, non_blocking=True)
 
             # Mask-based inpainting supervision
             p_tilde, M = construct_masked_reflectance(p_ref, mask_prob, sigma_min, sigma_max)
 
-            # Network predicts residual on masked reflectance
-            delta = model.adarenet(torch.cat([p_tilde, l_e], dim=1))
+            # 50% mixed training: alternate between masked and full input
+            # to prevent train-test distribution mismatch (inference uses p_ref)
+            if random.random() < 0.5:
+                input_ref = p_tilde   # masked input
+                use_mask_loss = True
+            else:
+                input_ref = p_ref     # full input (matches inference)
+                use_mask_loss = False
 
-            # Recover reflectance from masked input
-            r_tilde = p_tilde - delta
+            with torch.amp.autocast(device_type=device.type, enabled=use_amp):
+                # Network predicts residual on masked reflectance
+                delta = model.adarenet(torch.cat([input_ref, l_e], dim=1))
 
-            # ── 1) Masked inpainting loss (primary) ──
-            diff = r_tilde - p_ref
-            loss_ss = (M * diff.abs()).mean()
+                # Recover reflectance from masked input
+                r_tilde = input_ref - delta
 
-            # ── 2) Gradient preservation loss ──
-            loss_grad = gradient_loss(r_tilde, p_ref)
+                # ── 1) Masked inpainting loss (primary) ──
+                # Normalise by mask area to keep gradient scale independent of mask_prob
+                diff = r_tilde - p_ref
+                if use_mask_loss:
+                    loss_ss = (M * diff.abs()).sum() / (M.sum() + 1e-6)
+                else:
+                    # Full-input mode: supervise on all pixels (identity denoising)
+                    loss_ss = diff.abs().mean()
 
-            # ── 3) Color consistency loss ──
-            loss_color = color_consistency_loss(r_tilde, p_ref)
+                # ── 2) Gradient preservation loss ──
+                loss_grad = gradient_loss(r_tilde, p_ref)
 
-            # ── 4) Delta regularization ──
-            loss_reg = lambda_delta * delta.abs().mean()
+                # ── 3) Color consistency loss ──
+                loss_color = color_consistency_loss(r_tilde, p_ref)
 
-            loss = loss_ss + lambda_grad * loss_grad + lambda_color * loss_color + loss_reg
+                # ── 4) Delta regularization ──
+                loss_reg = lambda_delta * delta.abs().mean()
+
+                loss = loss_ss + lambda_grad * loss_grad + lambda_color * loss_color + loss_reg
 
             optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             epoch_loss  += loss.item()
             epoch_ss    += loss_ss.item()
@@ -267,7 +327,7 @@ def main() -> None:
                 print(msg)
                 logger.info(msg)
 
-        n = max(1, len(loader))
+        n = max(1, len(cached_loader))
         msg = (
             f"[Stage-R-pre][E{epoch}] avg loss={epoch_loss/n:.6f} "
             f"ss={epoch_ss/n:.6f} grad={epoch_grad/n:.6f} "

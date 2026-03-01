@@ -82,6 +82,7 @@ def main():
     tau = float(cfg["constants"]["tau"])
     eps = float(cfg["constants"]["eps"])
     illum_adjust_mode = cfg["constants"].get("illum_adjust_mode", "gamma")
+    pref_max = float(cfg["constants"].get("pref_max", 5.0))
 
     # Dataset
     data_cfg = cfg["data"]
@@ -151,6 +152,7 @@ def main():
             # Step 2: Reflectance proxy (without denoising)
             l_tilde = torch.clamp(l_t, min=tau)
             p_ref = low / (l_tilde + eps)
+            p_ref = torch.clamp(p_ref, 0.0, pref_max)  # prevent dark-area explosion
 
             # Step 3: Reconstruct (no denoising, just illumination enhancement)
             i_hat = torch.clamp(p_ref * l_e, 0.0, 1.0)  # [B, 3, H, W]

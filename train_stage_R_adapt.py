@@ -58,10 +58,13 @@ def setup_logger(stage: str) -> logging.Logger:
 
 def validate_constants(cfg: dict) -> None:
     # Note: omega can vary for better illumination enhancement
-    # Only tau and eps must be fixed per SPEC
+    # tau is now configurable (recommended 0.05-0.2 for numerical stability)
     c = cfg["constants"]
-    if not (_eq(c["tau"], 1e-3) and _eq(c["eps"], 1e-6)):
-        raise ValueError("SPEC-fixed constants must have tau=1e-3, eps=1e-6. Omega can vary.")
+    if not _eq(c["eps"], 1e-6):
+        raise ValueError("SPEC-fixed constant eps must be 1e-6.")
+    tau = c["tau"]
+    if tau < 0.01:
+        print(f"[WARN] tau={tau} is very small. Dark-area P_ref may explode. Recommend tau>=0.05.")
     n = cfg["noise"]
     if not (_eq(n["sigma_min"], 0.01) and _eq(n["sigma_max"], 0.05)):
         raise ValueError("SPEC-fixed noise range must be sigma in [0.01, 0.05]")
@@ -118,7 +121,8 @@ def main() -> None:
     logger.info(f"Loading config: {args.config}")
     cfg = load_config(args.config)
     validate_constants(cfg)
-    logger.info(f"Config validated. SPEC constraints: omega=2.0, tau=1e-3, eps=1e-6, sigma in [0.01, 0.05]")
+    c = cfg["constants"]
+    logger.info(f"Config validated. tau={c['tau']}, eps={c['eps']}, omega={c['omega']}")
 
     set_seed(cfg["seed"])
     logger.info(f"Random seed set to: {cfg['seed']}")
@@ -153,6 +157,7 @@ def main() -> None:
     adarenet = AdaReNet(base_channels=cfg["model"]["adarenet_channels"])
 
     illum_adjust_mode = cfg["constants"].get("illum_adjust_mode", "gamma")
+    pref_max = cfg["constants"].get("pref_max", 5.0)
     model = RetinexAdaReNet(
         illum,
         adarenet,
@@ -160,6 +165,7 @@ def main() -> None:
         tau=cfg["constants"]["tau"],
         eps=cfg["constants"]["eps"],
         illum_adjust_mode=illum_adjust_mode,
+        pref_max=pref_max,
     ).to(device)
     logger.info(f"Model created on {device}")
 

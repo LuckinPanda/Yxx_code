@@ -23,14 +23,24 @@ class RotEqBlock(nn.Module):
         self.act = nn.ReLU(inplace=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Rotation-equivariant response via shared weights over 0/90/180/270 rotations.
-        outs = []
-        for k in (0, 1, 2, 3):
-            xr = _rotate(x, k)
-            yr = self.conv(xr)
-            y = _rotate(yr, -k)
-            outs.append(y)
-        y = torch.stack(outs, dim=0).mean(dim=0)
+        # Rotation-equivariant response via shared weights over 0/90/180/270.
+        # Batched: group (0°, 180°) and (90°, 270°) since they share spatial dims.
+        # 2 conv calls instead of 4 → ~2x faster.
+        B = x.shape[0]
+        x2 = _rotate(x, 2)   # 180° — same HxW as original
+        x1 = _rotate(x, 1)   # 90°  — HxW swapped
+        x3 = _rotate(x, 3)   # 270° — HxW swapped (same as 90°)
+
+        # Batch 0° + 180° (same shape)
+        y02 = self.conv(torch.cat([x, x2], dim=0))
+        y0, y2 = y02.split(B, dim=0)
+
+        # Batch 90° + 270° (same shape)
+        y13 = self.conv(torch.cat([x1, x3], dim=0))
+        y1, y3 = y13.split(B, dim=0)
+
+        # Rotate back and average
+        y = (y0 + _rotate(y1, -1) + _rotate(y2, -2) + _rotate(y3, -3)) * 0.25
         return self.act(y)
 
 
