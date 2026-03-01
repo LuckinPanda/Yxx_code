@@ -1,0 +1,36 @@
+seed: 42
+
+data:
+  mode: source_paired
+  source_low_dir: /home/yannayanna/datasets/LSRW/Train/Low
+  source_high_dir: /home/yannayanna/datasets/LSRW/Train/High
+  target_low_dir: null
+  resize: [960, 640]
+  num_workers: 4
+
+train:
+  batch_size: 4
+  epochs: 30
+  lr: 0.0002
+  log_interval: 50
+  save_dir: checkpoints
+  save_name: illum_ckpt.pth
+  # Stage-L loss weights
+  lambda_illum: 1.0      # L1(L_T, L_pseudo_retinex)
+  lambda_tv: 0.1         # TV smoothness on L_T
+  lambda_recon: 1.0      # L1(L_T * I_high, I_low) reconstruction consistency
+
+model:
+  illumination_channels: 32
+  adarenet_channels: 32
+
+constants:
+  # Must be consistent across training and inference
+  omega: 15.0
+  tau: 0.001
+  eps: 0.000001
+  illum_adjust_mode: gamma   # "gamma" (L_T^(1/omega)) or "linear" (L_T * omega)
+
+noise:
+  sigma_min: 0.01
+  sigma_max: 0.05

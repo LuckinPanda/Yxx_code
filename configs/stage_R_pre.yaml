@@ -1,0 +1,40 @@
+seed: 42
+
+data:
+  mode: source_low_only
+  source_low_dir: /home/yannayanna/datasets/LSRW/Train/Low
+  source_high_dir: null
+  target_low_dir: null
+  resize: [960, 640]
+  num_workers: 4
+
+train:
+  batch_size: 4
+  epochs: 20
+  lr: 0.0001
+  log_interval: 50
+  mask_prob: 0.2
+  save_dir: checkpoints
+  save_name: denoise_pre_ckpt.pth
+  # Loss weights
+  lambda_delta: 0.15     # delta regularization
+  lambda_grad: 0.1       # gradient preservation
+  lambda_color: 0.5      # color consistency
+
+model:
+  illumination_channels: 32
+  adarenet_channels: 32
+
+constants:
+  # Must be consistent across training and inference
+  omega: 15.0
+  tau: 0.001
+  eps: 0.000001
+  illum_adjust_mode: gamma
+
+noise:
+  sigma_min: 0.01
+  sigma_max: 0.05
+
+ckpt:
+  illum_ckpt_path: checkpoints/illum_ckpt.pth

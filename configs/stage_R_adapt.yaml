@@ -1,0 +1,41 @@
+# Deprecated: Stage-R-adapt is temporarily abandoned.
+# This config is kept for reference only and not used in current experiments.
+seed: 42
+
+data:
+  mode: target_low_only
+  source_low_dir: null
+  source_high_dir: null
+  target_low_dir: /home/yannayanna/datasets/LOLv2_raw/LOL-v2/Real_captured/Train/Low
+  resize: null
+  num_workers: 4
+
+train:
+  batch_size: 1
+  epochs: 10
+  lr: 0.0001
+  log_interval: 50
+  lambda_anc: 0.01
+  lambda_delta: 0.0
+  mask_prob: 0.2
+  save_dir: checkpoints
+  save_name: denoise_adapt_ckpt.pth
+
+model:
+  illumination_channels: 32
+  adarenet_channels: 32
+
+constants:
+  # Must be consistent across training and inference
+  omega: 15.0
+  tau: 0.001
+  eps: 0.000001
+  illum_adjust_mode: gamma
+
+noise:
+  sigma_min: 0.01
+  sigma_max: 0.05
+
+ckpt:
+  illum_ckpt_path: checkpoints/illum_ckpt.pth
+  denoise_pre_ckpt_path: checkpoints/denoise_pre_ckpt.pth
