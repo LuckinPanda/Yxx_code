@@ -79,7 +79,6 @@ class AdaReNet(nn.Module):
         f_e = self.e3(self.e2(self.e1(x)))
         m = self.fusion_mask(f_v, f_e)
         # M_f gates between Vanilla and EQ branches per-pixel.
-        # M_f is the Fusion MaskNetwork output (structural gating) used to combine f_v and f_e.
         f = m * f_v + (1.0 - m) * f_e
         delta = self.out_conv(f)
         return delta

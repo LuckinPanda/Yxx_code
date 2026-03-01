@@ -208,6 +208,7 @@ def main() -> None:
     parser.add_argument("--compute_lpips", action="store_true", help="Compute LPIPS metric (requires lpips package)")
     parser.add_argument("--no_color_correct", action="store_true", help="Disable gray-world color correction")
     parser.add_argument("--color_strength", type=float, default=0.3, help="Color correction strength (0=off, 1=full, default=0.3)")
+    parser.add_argument("--tta", action="store_true", help="Enable Test-Time Augmentation (4x flip ensemble)")
     args = parser.parse_args()
 
     # Set random seed if specified
@@ -324,6 +325,22 @@ def main() -> None:
                 l_t, l_e = model.compute_illumination(low)
                 p_ref = model.compute_pref(low, l_t)
                 i_hat = torch.clamp(p_ref * l_e, 0.0, 1.0)[0]
+            elif args.tta:
+                # Test-Time Augmentation: 4-fold flip ensemble
+                # Reduces noise by averaging predictions from 4 orientations
+                augments = [
+                    (lambda x: x, lambda x: x),                                    # original
+                    (lambda x: torch.flip(x, [3]), lambda x: torch.flip(x, [3])),  # H-flip
+                    (lambda x: torch.flip(x, [2]), lambda x: torch.flip(x, [2])),  # V-flip
+                    (lambda x: torch.flip(x, [2, 3]), lambda x: torch.flip(x, [2, 3])),  # HV-flip
+                ]
+                i_hat_sum = torch.zeros_like(low[0])
+                for fwd_fn, inv_fn in augments:
+                    aug_low = fwd_fn(low)
+                    aug_out = model(aug_low)
+                    aug_i_hat = aug_out["I_hat"][0]
+                    i_hat_sum = i_hat_sum + inv_fn(aug_i_hat.unsqueeze(0))[0]
+                i_hat = i_hat_sum / len(augments)
             else:
                 out = model(low)
                 i_hat = out["I_hat"][0]

@@ -228,6 +228,15 @@ def main() -> None:
     optimizer = torch.optim.Adam(model.adarenet.parameters(), lr=cfg["train"]["lr"])
     logger.info(f"Optimizer: Adam, lr={cfg['train']['lr']}")
 
+    # CosineAnnealing LR schedule (if enabled)
+    use_cosine_lr = cfg["train"].get("use_cosine_lr", False)
+    scheduler = None
+    if use_cosine_lr:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=cfg["train"]["epochs"], eta_min=1e-6
+        )
+        logger.info(f"CosineAnnealingLR: T_max={cfg['train']['epochs']}, eta_min=1e-6")
+
     save_dir = Path(cfg["train"]["save_dir"])
     save_dir.mkdir(parents=True, exist_ok=True)
     save_path = save_dir / cfg["train"]["save_name"]
@@ -246,11 +255,15 @@ def main() -> None:
     lambda_delta = cfg["train"].get("lambda_delta", 0.15)
     mask_prob    = cfg["train"].get("mask_prob", 0.2)
     lambda_grad  = cfg["train"].get("lambda_grad", 0.1)
-    lambda_color = cfg["train"].get("lambda_color", 0.5)
+    lambda_color = cfg["train"].get("lambda_color", 0.3)
+    full_input_ratio = cfg["train"].get("full_input_ratio", 0.2)
+    use_augment  = cfg["train"].get("augment", False)
+    use_cosine   = cfg["train"].get("use_cosine_lr", False)
 
     logger.info(
         f"Training: {epochs} epochs, mask_prob={mask_prob}, sigma=[{sigma_min},{sigma_max}], "
-        f"lambda_delta={lambda_delta}, lambda_grad={lambda_grad}, lambda_color={lambda_color}"
+        f"lambda_delta={lambda_delta}, lambda_grad={lambda_grad}, lambda_color={lambda_color}, "
+        f"full_input_ratio={full_input_ratio}, augment={use_augment}, cosine_lr={use_cosine}"
     )
 
     logger.info("=" * 80)
@@ -275,14 +288,28 @@ def main() -> None:
             # Mask-based inpainting supervision
             p_tilde, M = construct_masked_reflectance(p_ref, mask_prob, sigma_min, sigma_max)
 
-            # 50% mixed training: alternate between masked and full input
-            # to prevent train-test distribution mismatch (inference uses p_ref)
-            if random.random() < 0.5:
-                input_ref = p_tilde   # masked input
-                use_mask_loss = True
-            else:
+            # Data augmentation: random flip only (rotation is redundant with RotEqBlock)
+            if use_augment:
+                # Random horizontal flip
+                if random.random() < 0.5:
+                    p_ref = torch.flip(p_ref, dims=[3])
+                    l_e = torch.flip(l_e, dims=[3])
+                # Random vertical flip
+                if random.random() < 0.5:
+                    p_ref = torch.flip(p_ref, dims=[2])
+                    l_e = torch.flip(l_e, dims=[2])
+                # Re-construct masked input after augmentation
+                p_tilde, M = construct_masked_reflectance(p_ref, mask_prob, sigma_min, sigma_max)
+
+            # Mixed training: mostly masked input, small fraction full input
+            # Full-input helps bridge train-test gap (inference uses p_ref)
+            # but too much causes identity mapping. 20% is a good balance.
+            if random.random() < full_input_ratio:
                 input_ref = p_ref     # full input (matches inference)
                 use_mask_loss = False
+            else:
+                input_ref = p_tilde   # masked input
+                use_mask_loss = True
 
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
                 # Network predicts residual on masked reflectance
@@ -313,6 +340,9 @@ def main() -> None:
 
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
+            # Gradient clipping to prevent exploding gradients with deeper model
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.adarenet.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
 
@@ -340,6 +370,10 @@ def main() -> None:
         )
         print(msg)
         logger.info(msg)
+
+        # Step LR scheduler
+        if scheduler is not None:
+            scheduler.step()
 
         # Periodic checkpoint save
         if epoch % save_interval == 0:
