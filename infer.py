@@ -19,6 +19,22 @@ from src.utils.config import load_config
 from src.utils.image import save_image
 
 
+def make_comparison(low: torch.Tensor, enhanced: torch.Tensor, high: torch.Tensor) -> torch.Tensor:
+    """Create a side-by-side comparison image: low | enhanced | high.
+
+    Args:
+        low: [3, H, W] low-light input
+        enhanced: [3, H, W] model output
+        high: [3, H, W] ground truth normal-light
+
+    Returns:
+        [3, H, W*3 + 4] concatenated image with 2px white separator
+    """
+    _, H, W = low.shape
+    sep = torch.ones(3, H, 2, device=low.device)  # white separator
+    return torch.cat([low, sep, enhanced, sep, high], dim=2)
+
+
 def _eq(a: float, b: float, tol: float = 1e-12) -> bool:
     return abs(float(a) - float(b)) < tol
 
@@ -264,6 +280,8 @@ def main() -> None:
     else:
         out_dir = base_out_dir / f"{args.mode}_{timestamp}"
     out_dir.mkdir(parents=True, exist_ok=True)
+    compare_dir = out_dir / "comparison"
+    compare_dir.mkdir(parents=True, exist_ok=True)
     print(f"[Infer] Output directory: {out_dir}")
 
     # Metrics tracking
@@ -290,6 +308,13 @@ def main() -> None:
             # Compute metrics if ground truth available
             if "high" in batch:
                 high = batch["high"].to(device, non_blocking=True)
+
+                # Save comparison image: low | enhanced | ground truth
+                comparison = make_comparison(
+                    low[0].clamp(0, 1), i_hat.clamp(0, 1), high[0].clamp(0, 1)
+                )
+                save_image(comparison, str(compare_dir / name))
+
                 pred = i_hat.unsqueeze(0)
                 target = high
                 

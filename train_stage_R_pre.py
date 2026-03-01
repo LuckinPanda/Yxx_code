@@ -232,6 +232,11 @@ def main() -> None:
     save_dir.mkdir(parents=True, exist_ok=True)
     save_path = save_dir / cfg["train"]["save_name"]
 
+    # Periodic checkpoint folder
+    save_interval = cfg["train"].get("save_interval", 20)
+    periodic_dir = save_dir / "stage_R_pre"
+    periodic_dir.mkdir(parents=True, exist_ok=True)
+
     epochs       = cfg["train"]["epochs"]
     log_interval = cfg["train"]["log_interval"]
     sigma_min    = cfg["noise"]["sigma_min"]
@@ -335,6 +340,12 @@ def main() -> None:
         )
         print(msg)
         logger.info(msg)
+
+        # Periodic checkpoint save
+        if epoch % save_interval == 0:
+            periodic_path = periodic_dir / f"epoch_{epoch:04d}.pth"
+            torch.save(model.adarenet.state_dict(), periodic_path)
+            logger.info(f"Periodic checkpoint saved: {periodic_path}")
 
     torch.save(model.adarenet.state_dict(), save_path)
     logger.info(f"Checkpoint saved: {save_path}")
