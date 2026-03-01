@@ -96,29 +96,26 @@ def construct_masked_reflectance(p_ref: torch.Tensor, mask_prob: float, sigma_mi
 
 # ── Additional loss functions ─────────────────────────────────────────────
 
-def tv_loss_on_reflectance(r: torch.Tensor) -> torch.Tensor:
-    """Total Variation loss on recovered reflectance R_e.
+def gradient_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Gradient-domain L1 loss for edge / structure preservation."""
+    pred_dx  = pred[:, :, :, 1:]  - pred[:, :, :, :-1]
+    pred_dy  = pred[:, :, 1:, :]  - pred[:, :, :-1, :]
+    tgt_dx   = target[:, :, :, 1:] - target[:, :, :, :-1]
+    tgt_dy   = target[:, :, 1:, :] - target[:, :, :-1, :]
+    return F.l1_loss(pred_dx, tgt_dx) + F.l1_loss(pred_dy, tgt_dy)
 
-    Encourages spatial smoothness of the output, which acts as an
-    implicit denoising prior.  Unlike gradient_loss(pred, noisy_target),
-    this does NOT force the output to replicate noisy gradients.
+
+def color_consistency_loss(
+    pred: torch.Tensor, target: torch.Tensor, eps: float = 1e-6
+) -> torch.Tensor:
+    """Channel-ratio preservation loss to prevent color shift.
+
+    Compares normalised RGB ratios so that channel balance is maintained
+    even if overall brightness changes.
     """
-    diff_h = (r[:, :, 1:, :] - r[:, :, :-1, :]).abs().mean()
-    diff_w = (r[:, :, :, 1:] - r[:, :, :, :-1]).abs().mean()
-    return diff_h + diff_w
-
-
-def channel_balance_loss(pred: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """Channel balance prior: encourage R/G/B channel means to be similar.
-
-    Under the assumption that average reflectance across a scene is
-    roughly achromatic (gray-world prior), this prevents systematic
-    color shifts (e.g. green tint) without requiring a clean reference.
-    """
-    # pred: [B, 3, H, W]
-    ch_mean = pred.mean(dim=(2, 3))  # [B, 3]
-    ch_mean_avg = ch_mean.mean(dim=1, keepdim=True)  # [B, 1]
-    return (ch_mean - ch_mean_avg).abs().mean()
+    pred_sum  = pred.sum(dim=1, keepdim=True) + eps
+    tgt_sum   = target.sum(dim=1, keepdim=True) + eps
+    return F.l1_loss(pred / pred_sum, target / tgt_sum)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────
@@ -168,9 +165,7 @@ def main() -> None:
     adarenet = AdaReNet(base_channels=cfg["model"]["adarenet_channels"])
 
     illum_adjust_mode = cfg["constants"].get("illum_adjust_mode", "gamma")
-    pref_max = cfg["constants"].get("pref_max", 3.0)
-    gf_radius = cfg["constants"].get("guided_filter_radius", 3)
-    gf_eps = cfg["constants"].get("guided_filter_eps", 0.02)
+    pref_max = cfg["constants"].get("pref_max", 5.0)
     model = RetinexAdaReNet(
         illum,
         adarenet,
@@ -179,8 +174,6 @@ def main() -> None:
         eps=cfg["constants"]["eps"],
         illum_adjust_mode=illum_adjust_mode,
         pref_max=pref_max,
-        guided_filter_radius=gf_radius,
-        guided_filter_eps=gf_eps,
     ).to(device)
     logger.info(f"Model created on {device}")
 
@@ -250,19 +243,19 @@ def main() -> None:
     sigma_max    = cfg["noise"]["sigma_max"]
 
     # Loss weights
-    lambda_delta = cfg["train"].get("lambda_delta", 0.05)
-    mask_prob    = cfg["train"].get("mask_prob", 0.3)
-    lambda_tv    = cfg["train"].get("lambda_tv", 0.05)
-    lambda_cb    = cfg["train"].get("lambda_cb", 0.1)
+    lambda_delta = cfg["train"].get("lambda_delta", 0.15)
+    mask_prob    = cfg["train"].get("mask_prob", 0.2)
+    lambda_grad  = cfg["train"].get("lambda_grad", 0.1)
+    lambda_color = cfg["train"].get("lambda_color", 0.5)
 
     logger.info(
         f"Training: {epochs} epochs, mask_prob={mask_prob}, sigma=[{sigma_min},{sigma_max}], "
-        f"lambda_delta={lambda_delta}, lambda_tv={lambda_tv}, lambda_cb={lambda_cb}"
+        f"lambda_delta={lambda_delta}, lambda_grad={lambda_grad}, lambda_color={lambda_color}"
     )
 
     logger.info("=" * 80)
-    logger.info("Starting Stage-R-pre (Reflectance Pretraining with Noise2Self-style Masked Loss)")
-    logger.info("Losses: L_ss(masked-only) + TV(R_e) + channel_balance(R_e) + delta_reg")
+    logger.info("Starting Stage-R-pre (Reflectance Pretraining with Mask-Based Self-Supervised Loss)")
+    logger.info("Losses: L_ss(masked) + grad_preserve + color_consistency + delta_reg")
     logger.info("=" * 80)
     # AMP (mixed precision) for ~1.5-2x speedup on modern GPUs
     use_amp = device.type == "cuda"
@@ -272,47 +265,51 @@ def main() -> None:
     for epoch in range(1, epochs + 1):
         epoch_loss = 0.0
         epoch_ss = 0.0
-        epoch_tv = 0.0
-        epoch_cb = 0.0
+        epoch_grad = 0.0
+        epoch_color = 0.0
         epoch_reg = 0.0
         for step, batch in enumerate(tqdm(cached_loader, desc=f"Stage-R-pre Epoch {epoch}", ncols=80)):
             l_e = batch["l_e"].to(device, non_blocking=True)
             p_ref = batch["p_ref"].to(device, non_blocking=True)
 
-            # Mask-based inpainting supervision (Noise2Self principle)
-            # Always use masked input — the key Noise2Self guarantee:
-            # predicting masked pixels from unmasked neighbors converges
-            # to the clean signal, NOT the noise.
+            # Mask-based inpainting supervision
             p_tilde, M = construct_masked_reflectance(p_ref, mask_prob, sigma_min, sigma_max)
+
+            # 50% mixed training: alternate between masked and full input
+            # to prevent train-test distribution mismatch (inference uses p_ref)
+            if random.random() < 0.5:
+                input_ref = p_tilde   # masked input
+                use_mask_loss = True
+            else:
+                input_ref = p_ref     # full input (matches inference)
+                use_mask_loss = False
 
             with torch.amp.autocast(device_type=device.type, enabled=use_amp):
                 # Network predicts residual on masked reflectance
-                delta = model.adarenet(torch.cat([p_tilde, l_e], dim=1))
+                delta = model.adarenet(torch.cat([input_ref, l_e], dim=1))
 
                 # Recover reflectance from masked input
-                r_tilde = p_tilde - delta
+                r_tilde = input_ref - delta
 
-                # ── 1) Masked-pixel-only inpainting loss (Noise2Self) ──
-                # Only supervise on masked pixels: the network must predict
-                # them from their neighbors, so it learns the clean signal.
+                # ── 1) Masked inpainting loss (primary) ──
+                # Normalise by mask area to keep gradient scale independent of mask_prob
                 diff = r_tilde - p_ref
-                loss_ss = (M * diff.abs()).sum() / (M.sum() + 1e-6)
+                if use_mask_loss:
+                    loss_ss = (M * diff.abs()).sum() / (M.sum() + 1e-6)
+                else:
+                    # Full-input mode: supervise on all pixels (identity denoising)
+                    loss_ss = diff.abs().mean()
 
-                # ── 2) TV smoothness on recovered reflectance ──
-                # Implicit denoising prior: encourages R_e to be smooth.
-                # Unlike gradient_loss(pred, noisy_P_ref), this does NOT
-                # force the output to match noisy gradients.
-                loss_tv = tv_loss_on_reflectance(r_tilde)
+                # ── 2) Gradient preservation loss ──
+                loss_grad = gradient_loss(r_tilde, p_ref)
 
-                # ── 3) Channel balance prior (gray-world) ──
-                # Prevents systematic color shift (green tint) without
-                # needing a clean reference image.
-                loss_cb = channel_balance_loss(r_tilde)
+                # ── 3) Color consistency loss ──
+                loss_color = color_consistency_loss(r_tilde, p_ref)
 
-                # ── 4) Delta regularization (mild) ──
+                # ── 4) Delta regularization ──
                 loss_reg = lambda_delta * delta.abs().mean()
 
-                loss = loss_ss + lambda_tv * loss_tv + lambda_cb * loss_cb + loss_reg
+                loss = loss_ss + lambda_grad * loss_grad + lambda_color * loss_color + loss_reg
 
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -321,16 +318,16 @@ def main() -> None:
 
             epoch_loss  += loss.item()
             epoch_ss    += loss_ss.item()
-            epoch_tv    += loss_tv.item()
-            epoch_cb    += loss_cb.item()
+            epoch_grad  += loss_grad.item()
+            epoch_color += loss_color.item()
             epoch_reg   += loss_reg.item()
 
             if (step + 1) % log_interval == 0:
                 lr = optimizer.param_groups[0]["lr"]
                 msg = (
                     f"[Stage-R-pre][E{epoch}][S{step+1}] loss={loss.item():.6f} "
-                    f"ss={loss_ss.item():.6f} tv={loss_tv.item():.6f} "
-                    f"cb={loss_cb.item():.6f} reg={loss_reg.item():.6f} lr={lr:.6g}"
+                    f"ss={loss_ss.item():.6f} grad={loss_grad.item():.6f} "
+                    f"color={loss_color.item():.6f} reg={loss_reg.item():.6f} lr={lr:.6g}"
                 )
                 print(msg)
                 logger.info(msg)
@@ -338,8 +335,8 @@ def main() -> None:
         n = max(1, len(cached_loader))
         msg = (
             f"[Stage-R-pre][E{epoch}] avg loss={epoch_loss/n:.6f} "
-            f"ss={epoch_ss/n:.6f} tv={epoch_tv/n:.6f} "
-            f"cb={epoch_cb/n:.6f} reg={epoch_reg/n:.6f}"
+            f"ss={epoch_ss/n:.6f} grad={epoch_grad/n:.6f} "
+            f"color={epoch_color/n:.6f} reg={epoch_reg/n:.6f}"
         )
         print(msg)
         logger.info(msg)

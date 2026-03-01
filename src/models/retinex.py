@@ -2,48 +2,6 @@ from typing import Dict
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-
-
-def _guided_filter(x: torch.Tensor, guide: torch.Tensor,
-                   radius: int = 5, eps: float = 0.01) -> torch.Tensor:
-    """Fast box-window guided filter (GPU-friendly, no external deps).
-
-    Smooths `x` using `guide` as edge-preserving structure reference.
-    Used to pre-denoise the low-light image before P_ref computation,
-    reducing noise that would otherwise be amplified by division.
-
-    Args:
-        x: [B, C, H, W] input to be filtered
-        guide: [B, 1, H, W] guidance image (e.g. L_T)
-        radius: box filter half-width
-        eps: regularization (larger = more smoothing)
-
-    Returns:
-        [B, C, H, W] filtered output
-    """
-    ksize = 2 * radius + 1
-    # Box filter via avg_pool2d (fast on GPU)
-    def box(t):
-        return F.avg_pool2d(t, ksize, stride=1, padding=radius)
-
-    N = box(torch.ones(1, 1, x.shape[2], x.shape[3], device=x.device))
-
-    mean_g = box(guide) / N
-    mean_x = box(x) / N
-    mean_gx = box(guide * x) / N
-    mean_gg = box(guide * guide) / N
-
-    cov_gx = mean_gx - mean_g * mean_x
-    var_g = mean_gg - mean_g * mean_g
-
-    a = cov_gx / (var_g + eps)
-    b = mean_x - a * mean_g
-
-    mean_a = box(a) / N
-    mean_b = box(b) / N
-
-    return mean_a * guide + mean_b
 
 
 class RetinexAdaReNet(nn.Module):
@@ -56,8 +14,6 @@ class RetinexAdaReNet(nn.Module):
         eps: float,
         illum_adjust_mode: str = "gamma",
         pref_max: float = 5.0,
-        guided_filter_radius: int = 3,
-        guided_filter_eps: float = 0.02,
     ) -> None:
         super().__init__()
         self.illumination = illumination
@@ -67,8 +23,6 @@ class RetinexAdaReNet(nn.Module):
         self.eps = float(eps)
         self.illum_adjust_mode = illum_adjust_mode
         self.pref_max = float(pref_max)
-        self.gf_radius = guided_filter_radius
-        self.gf_eps = guided_filter_eps
 
     def compute_illumination(self, x: torch.Tensor):
         l_t = self.illumination(x)  # 1 channel [B, 1, H, W]
@@ -83,18 +37,8 @@ class RetinexAdaReNet(nn.Module):
         return l_t, l_e
 
     def compute_pref(self, x: torch.Tensor, l_t: torch.Tensor):
-        # Pre-filter input with guided filter using L_T as guide.
-        # This reduces noise BEFORE the division amplifies it,
-        # while preserving edges aligned with illumination structure.
-        if self.gf_radius > 0:
-            x_filtered = _guided_filter(x, l_t, radius=self.gf_radius,
-                                        eps=self.gf_eps)
-            x_filtered = torch.clamp(x_filtered, 0.0, 1.0)
-        else:
-            x_filtered = x
-
         l_tilde = torch.clamp(l_t, min=self.tau)
-        p_ref = x_filtered / (l_tilde + self.eps)
+        p_ref = x / (l_tilde + self.eps)
         # Clamp P_ref to prevent numerical explosion in dark regions.
         # Without this, dark areas where L_T ≈ 0 produce P_ref >> 1,
         # amplifying noise catastrophically.
