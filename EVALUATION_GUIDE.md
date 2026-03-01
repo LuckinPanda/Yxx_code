@@ -15,13 +15,19 @@
 ### 1. 单次推理评估
 
 ```bash
-# 基础评估（PSNR + SSIM）
+# 基础评估（PSNR + SSIM），默认开启灰度世界颜色校正
 python infer.py --mode zero_shot --config configs/infer.yaml --seed 42
 
 # 添加 LPIPS 评估（需要网络下载预训练模型）
 python infer.py --mode zero_shot --config configs/infer.yaml --seed 42 --compute_lpips
 
-# adapt 模式评估
+# 关闭颜色校正
+python infer.py --mode zero_shot --config configs/infer.yaml --seed 42 --no_color_correct
+
+# 调整颜色校正强度 (0=关闭, 1=全开, 默认0.8)
+python infer.py --mode zero_shot --config configs/infer.yaml --seed 42 --color_strength 0.6
+
+# adapt 模式评估 (deprecated)
 python infer.py --mode adapt --config configs/infer.yaml --seed 123
 ```
 
@@ -96,7 +102,12 @@ python infer.py --mode zero_shot --config configs/infer.yaml --seed 42
 # 测试版本B（修改配置或checkpoint后）
 python infer.py --mode zero_shot --config configs/infer.yaml --seed 42
 
-# 对比两个输出目录中的 metrics_summary.json
+# 测试不同颜色校正强度
+python infer.py --mode zero_shot --config configs/infer.yaml --seed 42 --color_strength 0.5
+python infer.py --mode zero_shot --config configs/infer.yaml --seed 42 --color_strength 1.0
+python infer.py --mode zero_shot --config configs/infer.yaml --seed 42 --no_color_correct
+
+# 对比输出目录中的 metrics_summary.json
 ```
 
 ### 场景2：评估模型稳定性

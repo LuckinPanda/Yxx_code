@@ -149,7 +149,9 @@ def main() -> None:
     adarenet = AdaReNet(base_channels=cfg["model"]["adarenet_channels"])
 
     illum_adjust_mode = cfg["constants"].get("illum_adjust_mode", "gamma")
-    pref_max = cfg["constants"].get("pref_max", 5.0)
+    pref_max = cfg["constants"].get("pref_max", 3.0)
+    gf_radius = cfg["constants"].get("guided_filter_radius", 3)
+    gf_eps = cfg["constants"].get("guided_filter_eps", 0.02)
     model = RetinexAdaReNet(
         illum,
         adarenet,
@@ -158,6 +160,8 @@ def main() -> None:
         eps=cfg["constants"]["eps"],
         illum_adjust_mode=illum_adjust_mode,
         pref_max=pref_max,
+        guided_filter_radius=gf_radius,
+        guided_filter_eps=gf_eps,
     ).to(device)
 
     # Freeze AdaReNet in Stage-L (illumination pretraining)

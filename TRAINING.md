@@ -45,9 +45,14 @@ python train_all.py --stage L
 
 ### Stage-R-pre: 反射率预训练 (源域)
 
-- **输入**: 源域低光图像 (LSRW低光)
+- **输入**: 源域低光图像 (LOL低光)
 - **依赖**: 需要 `illum_ckpt.pth`
-- **训练**: 10个epoch，mask-based自监督学习
+- **训练**: 30个epoch，Noise2Self风格自监督学习
+- **损失函数**:
+  - `L_ss`: mask像素重建损失（Noise2Self 核心损失）
+  - `L_tv`: 输出反射率 R_e 的 TV 平滑先验（隐式去噪）
+  - `L_cb`: 通道平衡先验 / 灰度世界假设（防止偏色）
+  - `L_reg`: 温和的 delta 正则化
 - **输出**: `checkpoints/denoise_pre_ckpt.pth`
 - **配置**: `configs/stage_R_pre.yaml`
 
@@ -90,7 +95,14 @@ Stage-R-pre (需要illum_ckpt.pth → denoise_pre_ckpt.pth)
 
 ```bash
 # Zero-shot mode (使用预训练的反射率网络)
-python infer.py --mode zero_shot --config configs/infer.yaml
+# 默认开启灰度世界颜色校正
+python infer.py --mode zero_shot --config configs/infer.yaml --seed 42
+
+# 关闭颜色校正
+python infer.py --mode zero_shot --config configs/infer.yaml --seed 42 --no_color_correct
+
+# 调整颜色校正强度 (0=关闭, 1=全开, 默认0.8)
+python infer.py --mode zero_shot --config configs/infer.yaml --seed 42 --color_strength 0.6
 
 # Stage-R-adapt 暂时舍弃（deprecated）
 ```
@@ -105,7 +117,7 @@ python train_all.py
 
 # 等待训练完成...
 
-# 运行推理评估
+# 运行推理评估（默认开启颜色校正）
 python infer.py --mode zero_shot --config configs/infer.yaml --seed 42
 ```
 

@@ -30,7 +30,9 @@ constants:
   tau: 0.1
   eps: 0.000001
   illum_adjust_mode: gamma   # "gamma" (L_T^(1/omega)) or "linear" (L_T * omega)
-  pref_max: 5.0
+  pref_max: 3.0
+  guided_filter_radius: 3
+  guided_filter_eps: 0.02
 
 noise:
   sigma_min: 0.01

@@ -60,13 +60,16 @@ def main():
     tau = c["tau"]
     eps = c["eps"]
     omega = c["omega"]
-    pref_max = c.get("pref_max", 5.0)
+    pref_max = c.get("pref_max", 3.0)
     illum_adjust_mode = c.get("illum_adjust_mode", "gamma")
+    gf_radius = c.get("guided_filter_radius", 3)
+    gf_eps = c.get("guided_filter_eps", 0.02)
 
     illum = IlluminationNet(base_channels=cfg["model"]["illumination_channels"])
     adarenet = AdaReNet(base_channels=cfg["model"]["adarenet_channels"])
     model = RetinexAdaReNet(illum, adarenet, omega=omega, tau=tau, eps=eps,
-                            illum_adjust_mode=illum_adjust_mode, pref_max=pref_max)
+                            illum_adjust_mode=illum_adjust_mode, pref_max=pref_max,
+                            guided_filter_radius=gf_radius, guided_filter_eps=gf_eps)
     model.to(device)
 
     # Load checkpoints

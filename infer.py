@@ -19,6 +19,33 @@ from src.utils.config import load_config
 from src.utils.image import save_image
 
 
+def gray_world_correction(img: torch.Tensor, strength: float = 1.0) -> torch.Tensor:
+    """Gray-world color correction to eliminate systematic color cast.
+
+    Assumes the average color of a scene should be achromatic (gray).
+    Scales each channel so that channel means become equal, which
+    effectively removes global color shifts (e.g. green tint from
+    single-channel illumination division).
+
+    Args:
+        img: [3, H, W] or [B, 3, H, W] image in [0, 1]
+        strength: blending factor (0 = no correction, 1 = full correction)
+
+    Returns:
+        Color-corrected image in [0, 1]
+    """
+    if img.dim() == 3:
+        ch_mean = img.mean(dim=(1, 2), keepdim=True)  # [3, 1, 1]
+    else:
+        ch_mean = img.mean(dim=(2, 3), keepdim=True)  # [B, 3, 1, 1]
+    global_mean = ch_mean.mean(dim=-3, keepdim=True)   # scalar-like
+    # Per-channel gain to equalize means
+    gain = global_mean / (ch_mean + 1e-8)
+    # Blend between original and corrected
+    corrected = img * (1.0 - strength + strength * gain)
+    return corrected.clamp(0.0, 1.0)
+
+
 def make_comparison(low: torch.Tensor, enhanced: torch.Tensor, high: torch.Tensor) -> torch.Tensor:
     """Create a side-by-side comparison image: low | enhanced | high.
 
@@ -183,6 +210,8 @@ def main() -> None:
     parser.add_argument("--disable_adarenet", action="store_true", help="Bypass AdaReNet (delta=0) for debugging")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
     parser.add_argument("--compute_lpips", action="store_true", help="Compute LPIPS metric (requires lpips package)")
+    parser.add_argument("--no_color_correct", action="store_true", help="Disable gray-world color correction post-processing")
+    parser.add_argument("--color_strength", type=float, default=0.8, help="Color correction strength (0=off, 1=full)")
     args = parser.parse_args()
 
     # Set random seed if specified
@@ -246,7 +275,9 @@ def main() -> None:
     adarenet = AdaReNet(base_channels=cfg["model"]["adarenet_channels"])
 
     illum_adjust_mode = cfg["constants"].get("illum_adjust_mode", "gamma")
-    pref_max = cfg["constants"].get("pref_max", 5.0)
+    pref_max = cfg["constants"].get("pref_max", 3.0)
+    gf_radius = cfg["constants"].get("guided_filter_radius", 3)
+    gf_eps = cfg["constants"].get("guided_filter_eps", 0.02)
     model = RetinexAdaReNet(
         illum,
         adarenet,
@@ -255,6 +286,8 @@ def main() -> None:
         eps=cfg["constants"]["eps"],
         illum_adjust_mode=illum_adjust_mode,
         pref_max=pref_max,
+        guided_filter_radius=gf_radius,
+        guided_filter_eps=gf_eps,
     ).to(device)
 
     ckpt_cfg = cfg["ckpt"]
@@ -302,6 +335,10 @@ def main() -> None:
             else:
                 out = model(low)
                 i_hat = out["I_hat"][0]
+
+            # Post-processing: gray-world color correction
+            if not args.no_color_correct:
+                i_hat = gray_world_correction(i_hat, strength=args.color_strength)
             
             save_image(i_hat, str(out_dir / name))
 

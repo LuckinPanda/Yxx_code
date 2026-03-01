@@ -78,21 +78,36 @@ L_e = \text{clamp}\!\left(L_T^{\,1/\omega},\; 0,\; 1\right)
 
 To decouple noise from illumination, a reflectance proxy is constructed.
 
-### 4.1 Illumination Lower Bound
+### 4.1 Guided Filter Pre-Denoising
+
+Before computing the reflectance proxy, the low-light input is pre-filtered
+using a **guided filter** with \(L_T\) as the guidance image:
 
 \[
-\tilde{L}_T = \max(L_T, \tau), \quad \tau = 10^{-3}
+I_{filtered} = \text{GuidedFilter}(I,\; L_T,\; r,\; \epsilon_{gf})
 \]
 
-### 4.2 Reflectance Proxy
+- \(r = 3\) (filter radius), \(\epsilon_{gf} = 0.02\) (regularization)
+- This reduces noise **before** the division amplifies it,
+  while preserving edges aligned with illumination structure.
+- Implemented as box-window guided filter (GPU-friendly, no external deps).
+
+### 4.2 Illumination Lower Bound
 
 \[
-P_{ref} = \frac{I}{\tilde{L}_T + \varepsilon}, \quad \varepsilon = 10^{-6}
+\tilde{L}_T = \max(L_T, \tau), \quad \tau = 0.1
+\]
+
+### 4.3 Reflectance Proxy
+
+\[
+P_{ref} = \text{clamp}\!\left(\frac{I_{filtered}}{\tilde{L}_T + \varepsilon},\; 0,\; P_{max}\right), \quad \varepsilon = 10^{-6},\; P_{max} = 3.0
 \]
 
 - \(P_{ref} \in \mathbb{R}^{B \times 3 \times H \times W}\)
 - Broadcast division is used
-- No clipping is applied at this stage
+- \(P_{max} = 3.0\) prevents numerical explosion in dark regions
+  (lowered from 5.0 to further suppress noise amplification)
 
 ---
 
@@ -195,9 +210,9 @@ where:
 
 ---
 
-### 6.3 Residual Prediction and Masked Loss
+### 6.3 Residual Prediction and Noise2Self-style Masked Loss
 
-AdaReNet predicts residual:
+AdaReNet predicts residual **always on masked input** (no mixed full-input training):
 
 \[
 \Delta = G_R(\tilde{P}_{ref}, L_e)
@@ -209,28 +224,58 @@ Recovered reflectance:
 \tilde{R}_e = \tilde{P}_{ref} - \Delta
 \]
 
-Self-supervised loss is computed **only on masked pixels**:
+Self-supervised loss is computed **only on masked pixels** (Noise2Self principle):
 
 \[
 \mathcal{L}_{ss}
 =
-\left\|
-M \odot (\tilde{R}_e - P_{ref})
-\right\|_1
+\frac{\sum M \odot |\tilde{R}_e - P_{ref}|}{\sum M + 10^{-6}}
 \]
 
-This forces the network to predict missing reflectance structure
-rather than copying the input.
+This forces the network to predict missing reflectance from **neighbors only**,
+and by the Noise2Self theorem the optimal prediction converges to the
+clean signal rather than the noisy input.
+
+**Key design choices (v2)**:
+- 100% masked input (no 50% full-input mode which caused identity-mapping / noise retention)
+- Mask probability \(p = 0.3\) (increased from 0.2 for stronger denoising signal)
 
 ---
 
-### 6.4 Training Mechanism Clarification
+### 6.4 Auxiliary Losses
 
-- Masking is applied only to the input reflectance proxy.
-- Loss is computed only on masked pixels.
-- No paired clean image is used.
+In addition to the primary masked loss, two self-supervised priors are used:
+
+**TV smoothness on recovered reflectance:**
+
+\[
+\mathcal{L}_{tv} = \|\nabla_h \tilde{R}_e\|_1 + \|\nabla_w \tilde{R}_e\|_1
+\]
+
+Encourages spatial smoothness of the output as an implicit denoising prior.
+Unlike the previous `gradient_loss(pred, noisy_P_ref)`, this does **not** force
+the output to replicate noisy gradients.
+
+**Channel balance prior (gray-world):**
+
+\[
+\mathcal{L}_{cb} = \|\mu_{ch}(\tilde{R}_e) - \bar{\mu}(\tilde{R}_e)\|_1
+\]
+
+Prevents systematic color shift (e.g. green tint from single-channel \(L_T\) division)
+without requiring a clean reference image.
+
+---
+
+### 6.5 Training Mechanism Clarification
+
+- Masking is **always** applied to the input reflectance proxy.
+- Loss is computed **only** on masked pixels.
+- No paired clean image is used for denoising supervision.
 - Illumination branch remains frozen.
 - AdaReNet structure remains unchanged.
+- **No** `gradient_loss(pred, target)` or `color_consistency_loss(pred, target)`
+  against noisy \(P_{ref}\) (these were removed as they forced noise retention).
 
 The masking mechanism is used strictly as a self-supervised signal,
 and does not alter the inference architecture.
@@ -254,11 +299,12 @@ and does not alter the inference architecture.
 - Data: source-domain low-only images
 - Frozen: illumination network
 - Trainable: AdaReNet
-- Loss: \(\mathcal{L}_{ss} + \lambda_{grad} \mathcal{L}_{grad} + \lambda_{color} \mathcal{L}_{color} + \lambda_{\delta} \|\Delta\|_1\)
-  - \(\mathcal{L}_{ss}\): masked inpainting loss (primary, §6.3)
-  - \(\mathcal{L}_{grad}\): gradient-domain L1 for edge preservation
-  - \(\mathcal{L}_{color}\): channel-ratio consistency for color stability
-  - \(\|\Delta\|_1\): residual regularisation
+- Epochs: 30
+- Loss: \(\mathcal{L}_{ss} + \lambda_{tv} \mathcal{L}_{tv} + \lambda_{cb} \mathcal{L}_{cb} + \lambda_{\delta} \|\Delta\|_1\)
+  - \(\mathcal{L}_{ss}\): Noise2Self masked-pixel-only inpainting loss (§6.3)
+  - \(\mathcal{L}_{tv}\): TV smoothness on recovered reflectance (\(\lambda_{tv} = 0.05\))
+  - \(\mathcal{L}_{cb}\): channel balance prior / gray-world (\(\lambda_{cb} = 0.1\))
+  - \(\|\Delta\|_1\): mild residual regularisation (\(\lambda_{\delta} = 0.05\))
 - Output: `denoise_pre_ckpt.pth`
 
 ---
@@ -274,6 +320,13 @@ and does not alter the inference architecture.
 
 - Inference uses the pretrained AdaReNet weights \(\theta_F^{pre}\) (zero-shot only).
 - The forward pipeline is identical to training-time construction.
+- **Post-processing**: Gray-world color correction is applied to the output:
+  \[
+  \hat{I}_{corrected}(c) = \hat{I}(c) \cdot \frac{\bar{\mu}}{\mu_c + \epsilon}
+  \]
+  where \(\mu_c\) is the per-channel mean and \(\bar{\mu}\) is the global mean.
+  - Strength parameter (default 0.8) blends between original and corrected output.
+  - Can be disabled with `--no_color_correct` CLI flag.
 
 ---
 
@@ -293,10 +346,11 @@ Each ablation answers **whether rotation equivariance improves stability when em
 
 - AdaReNet is the **only** reflectance denoiser
 - Rotation equivariance is a **core prior**
-- No blind-spot / masked-pixel self-supervision
+- Mask-based Noise2Self self-supervision for denoising (no paired clean images)
 - No target-domain GT usage
 - No architectural difference between training and inference
 - **\(\omega\) must be identical across all stages and inference**
+- **Guided filter parameters must be consistent across training and inference**
 
 ---
 

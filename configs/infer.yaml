@@ -15,7 +15,9 @@ constants:
   tau: 0.1
   eps: 0.000001
   illum_adjust_mode: gamma
-  pref_max: 5.0
+  pref_max: 3.0
+  guided_filter_radius: 3
+  guided_filter_eps: 0.02
 
 ckpt:
   illum_ckpt_path: checkpoints/illum_ckpt.pth

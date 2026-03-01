@@ -10,16 +10,16 @@ data:
 
 train:
   batch_size: 4
-  epochs: 20
+  epochs: 30
   lr: 0.0001
   log_interval: 50
-  mask_prob: 0.2
+  mask_prob: 0.3
   save_dir: checkpoints
   save_name: denoise_pre_ckpt.pth
-  # Loss weights
-  lambda_delta: 0.15     # delta regularization
-  lambda_grad: 0.1       # gradient preservation
-  lambda_color: 0.5      # color consistency
+  # Loss weights (v2: Noise2Self-style)
+  lambda_delta: 0.05     # mild delta regularization (lowered from 0.15)
+  lambda_tv: 0.05        # TV smoothness on R_e (replaces gradient_loss)
+  lambda_cb: 0.1         # channel balance prior (replaces color_consistency)
 
 model:
   illumination_channels: 32
@@ -31,7 +31,9 @@ constants:
   tau: 0.1
   eps: 0.000001
   illum_adjust_mode: gamma
-  pref_max: 5.0
+  pref_max: 3.0
+  guided_filter_radius: 3
+  guided_filter_eps: 0.02
 
 noise:
   sigma_min: 0.01
