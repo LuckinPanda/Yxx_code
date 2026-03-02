@@ -5,9 +5,11 @@ import math
 from datetime import datetime
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
+from scipy.ndimage import gaussian_filter as scipy_gaussian
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -199,6 +201,103 @@ def save_summary_json(stats: dict, output_path: Path, metadata: dict = None) -> 
         json.dump(output_data, f, indent=2, ensure_ascii=False)
 
 
+# ─────────────────────────────────────────────────────────────
+# Post-processing functions (inference-time only, training unaffected)
+# ─────────────────────────────────────────────────────────────
+
+def bilateral_denoise_np(img_np: np.ndarray, d: int = 9,
+                         sigma_color: float = 30, sigma_space: float = 9) -> np.ndarray:
+    """Bilateral filter: smooths noise/color artifacts while preserving edges.
+    Input/output: [H,W,3] float32 in [0,1]."""
+    img_u8 = (np.clip(img_np, 0, 1) * 255).astype(np.uint8)
+    filtered = cv2.bilateralFilter(img_u8, d, sigma_color, sigma_space)
+    return filtered.astype(np.float32) / 255.0
+
+
+def auto_contrast_np(img_np: np.ndarray, clip_pct: float = 1.0) -> np.ndarray:
+    """Percentile-based contrast stretching.
+    Clips extreme pixel values then rescales to [0,1].
+    Input/output: [H,W,3] float32."""
+    low_val = np.percentile(img_np, clip_pct)
+    high_val = np.percentile(img_np, 100 - clip_pct)
+    if high_val - low_val < 1e-6:
+        return img_np
+    stretched = (img_np - low_val) / (high_val - low_val)
+    return np.clip(stretched, 0, 1).astype(np.float32)
+
+
+def unsharp_mask_np(img_np: np.ndarray, sigma: float = 1.0,
+                    strength: float = 0.3) -> np.ndarray:
+    """Unsharp masking for edge enhancement.
+    Input/output: [H,W,3] float32 in [0,1]."""
+    blurred = scipy_gaussian(img_np, sigma=[sigma, sigma, 0])
+    sharpened = img_np + strength * (img_np - blurred)
+    return np.clip(sharpened, 0, 1).astype(np.float32)
+
+
+def _make_gaussian_kernel_1d(sigma: float, device, dtype):
+    """Create 1D Gaussian kernel for separable convolution."""
+    ks = int(6 * sigma + 1) | 1  # ensure odd, ≥ 6σ+1
+    if ks < 3:
+        ks = 3
+    half = ks // 2
+    coords = torch.arange(ks, device=device, dtype=dtype) - half
+    g = torch.exp(-coords ** 2 / (2 * sigma ** 2))
+    return g / g.sum()
+
+
+def smooth_illumination_forward(model, x: torch.Tensor,
+                                smooth_sigma: float = 3.0) -> torch.Tensor:
+    """Enhanced forward pass: Gaussian-smooth L_T before P_ref computation.
+    Smoother illumination → less noise amplification in P_ref → cleaner output.
+    Also eliminates per-pixel brightness fluctuations.
+    Returns: [3,H,W] enhanced image (single image, no batch dim)."""
+    l_t, _ = model.compute_illumination(x)
+
+    # Separable Gaussian blur on L_T [B,1,H,W]
+    g = _make_gaussian_kernel_1d(smooth_sigma, x.device, x.dtype)
+    pad_h = len(g) // 2
+    l_t_s = F.conv2d(l_t, g.view(1, 1, -1, 1), padding=(pad_h, 0))
+    l_t_s = F.conv2d(l_t_s, g.view(1, 1, 1, -1), padding=(0, pad_h))
+
+    # Recompute L_e from smoothed L_T
+    if model.illum_adjust_mode == "gamma":
+        l_e = torch.clamp(l_t_s.pow(1.0 / model.omega), 0.0, 1.0)
+    else:
+        l_e = torch.clamp(l_t_s * model.omega, 0.0, 1.0)
+
+    # P_ref with smoothed L_T (less noise amplification)
+    l_tilde = torch.clamp(l_t_s, min=model.tau)
+    p_ref = torch.clamp(x / (l_tilde + model.eps), 0.0, model.pref_max)
+
+    # Run denoiser
+    delta = model.adarenet(torch.cat([p_ref, l_e], dim=1))
+    r_e = torch.clamp(p_ref - delta, 0.0)
+    i_hat = torch.clamp(r_e * l_e, 0.0, 1.0)
+    return i_hat[0]  # [3,H,W]
+
+
+def postprocess_tensor(img: torch.Tensor, bilateral: bool = True,
+                       contrast: bool = True, sharpen: bool = True,
+                       bilateral_d: int = 9, bilateral_sc: float = 30,
+                       bilateral_ss: float = 9, contrast_pct: float = 1.0,
+                       sharpen_sigma: float = 1.0,
+                       sharpen_strength: float = 0.3) -> torch.Tensor:
+    """Apply post-processing pipeline to [3,H,W] tensor in [0,1]."""
+    device = img.device
+    img_np = img.cpu().numpy().transpose(1, 2, 0)  # [H,W,3]
+    if bilateral:
+        img_np = bilateral_denoise_np(img_np, d=bilateral_d,
+                                       sigma_color=bilateral_sc,
+                                       sigma_space=bilateral_ss)
+    if contrast:
+        img_np = auto_contrast_np(img_np, clip_pct=contrast_pct)
+    if sharpen:
+        img_np = unsharp_mask_np(img_np, sigma=sharpen_sigma,
+                                 strength=sharpen_strength)
+    return torch.from_numpy(img_np.transpose(2, 0, 1)).float().to(device)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/infer.yaml")
@@ -209,6 +308,21 @@ def main() -> None:
     parser.add_argument("--no_color_correct", action="store_true", help="Disable gray-world color correction")
     parser.add_argument("--color_strength", type=float, default=0.3, help="Color correction strength (0=off, 1=full, default=0.3)")
     parser.add_argument("--tta", action="store_true", help="Enable Test-Time Augmentation (4x flip ensemble)")
+    # Post-processing enhancement pipeline
+    parser.add_argument("--enhance", action="store_true",
+                        help="Enable post-processing pipeline (bilateral + contrast + sharpen)")
+    parser.add_argument("--smooth_illum", type=float, default=0,
+                        help="Gaussian sigma for L_T smoothing (0=off, recommended: 3.0)")
+    parser.add_argument("--bilateral_sc", type=float, default=100,
+                        help="Bilateral filter sigmaColor (higher=more smoothing, default=100)")
+    parser.add_argument("--contrast_pct", type=float, default=1.0,
+                        help="Contrast stretch clip percentile (0-5)")
+    parser.add_argument("--sharpen_strength", type=float, default=0.3,
+                        help="Unsharp mask strength (0-1)")
+    # Individual post-processing toggles (when --enhance is set)
+    parser.add_argument("--no_bilateral", action="store_true", help="Disable bilateral denoising")
+    parser.add_argument("--no_contrast", action="store_true", help="Disable contrast stretching")
+    parser.add_argument("--no_sharpen", action="store_true", help="Disable unsharp mask")
     args = parser.parse_args()
 
     # Set random seed if specified
@@ -321,33 +435,51 @@ def main() -> None:
             low = batch["low"].to(device, non_blocking=True)
             name = batch["name"][0]
             
+            # --- Core inference path ---
+            use_smooth = args.smooth_illum > 0
+
+            def _forward_single(inp):
+                """Run single forward pass (standard or smooth-illum)."""
+                if use_smooth:
+                    return smooth_illumination_forward(model, inp, args.smooth_illum)
+                out_ = model(inp)
+                return out_["I_hat"][0]
+
             if args.disable_adarenet:
                 l_t, l_e = model.compute_illumination(low)
                 p_ref = model.compute_pref(low, l_t)
                 i_hat = torch.clamp(p_ref * l_e, 0.0, 1.0)[0]
             elif args.tta:
                 # Test-Time Augmentation: 4-fold flip ensemble
-                # Reduces noise by averaging predictions from 4 orientations
                 augments = [
-                    (lambda x: x, lambda x: x),                                    # original
-                    (lambda x: torch.flip(x, [3]), lambda x: torch.flip(x, [3])),  # H-flip
-                    (lambda x: torch.flip(x, [2]), lambda x: torch.flip(x, [2])),  # V-flip
-                    (lambda x: torch.flip(x, [2, 3]), lambda x: torch.flip(x, [2, 3])),  # HV-flip
+                    (lambda x: x, lambda x: x),
+                    (lambda x: torch.flip(x, [3]), lambda x: torch.flip(x, [3])),
+                    (lambda x: torch.flip(x, [2]), lambda x: torch.flip(x, [2])),
+                    (lambda x: torch.flip(x, [2, 3]), lambda x: torch.flip(x, [2, 3])),
                 ]
                 i_hat_sum = torch.zeros_like(low[0])
                 for fwd_fn, inv_fn in augments:
-                    aug_low = fwd_fn(low)
-                    aug_out = model(aug_low)
-                    aug_i_hat = aug_out["I_hat"][0]
-                    i_hat_sum = i_hat_sum + inv_fn(aug_i_hat.unsqueeze(0))[0]
+                    aug_i = _forward_single(fwd_fn(low))
+                    i_hat_sum = i_hat_sum + inv_fn(aug_i.unsqueeze(0))[0]
                 i_hat = i_hat_sum / len(augments)
             else:
-                out = model(low)
-                i_hat = out["I_hat"][0]
-            
-            # Optional gray-world color correction
+                i_hat = _forward_single(low)
+
+            # --- Color correction ---
             if not args.no_color_correct and args.color_strength > 0:
                 i_hat = gray_world_correction(i_hat, strength=args.color_strength)
+
+            # --- Post-processing pipeline ---
+            if args.enhance:
+                i_hat = postprocess_tensor(
+                    i_hat,
+                    bilateral=not args.no_bilateral,
+                    contrast=not args.no_contrast,
+                    sharpen=not args.no_sharpen,
+                    bilateral_sc=args.bilateral_sc,
+                    contrast_pct=args.contrast_pct,
+                    sharpen_strength=args.sharpen_strength,
+                )
 
             save_image(i_hat, str(out_dir / name))
 
