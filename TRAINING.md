@@ -47,12 +47,18 @@ python train_all.py --stage L
 
 - **输入**: 源域低光图像 (LOL低光)
 - **依赖**: 需要 `illum_ckpt.pth`
-- **训练**: 30个epoch，Noise2Self风格自监督学习
+- **训练**: **40个epoch**，Noise2Self风格自监督学习
+- **学习率**: 1e-4 (Adam, 固定学习率；CosineAnnealing可选但对此规模无益)
+- **数据增强**: 随机水平/垂直翻转（旋转增强与RotEqBlock冗余，故省略）
+- **梯度裁剪**: max_norm=1.0，防止梯度爆炸
+- **混合精度**: AMP自动启用（CUDA设备上约1.5-2×加速）
+- **预缓存**: 冻结的照明输出（L_e, P_ref）训练前一次性计算
+- **混合输入**: 50%使用masked输入（Noise2Self），50%使用完整输入（弥合训练-推理差距）
 - **损失函数**:
   - `L_ss`: mask像素重建损失（Noise2Self 核心损失）
-  - `L_tv`: 输出反射率 R_e 的 TV 平滑先验（隐式去噪）
-  - `L_cb`: 通道平衡先验 / 灰度世界假设（防止偏色）
-  - `L_reg`: 温和的 delta 正则化
+  - `L_grad`: 梯度域L1损失（边缘/结构保持），λ=0.1
+  - `L_color`: 通道比率颜色一致性（防止偏色），λ=0.5
+  - `L_reg`: 温和的 delta 正则化，λ=0.15
 - **输出**: `checkpoints/denoise_pre_ckpt.pth`
 - **配置**: `configs/stage_R_pre.yaml`
 
@@ -94,15 +100,20 @@ Stage-R-pre (需要illum_ckpt.pth → denoise_pre_ckpt.pth)
 训练完成后，运行推理：
 
 ```bash
-# Zero-shot mode (使用预训练的反射率网络)
-# 默认开启灰度世界颜色校正
+# Zero-shot mode（基础评估，默认开启颜色校正 + LPIPS + MAE）
 python infer.py --mode zero_shot --config configs/infer.yaml --seed 42
+
+# 推荐：TTA + 双边滤波（最佳视觉质量）
+python infer.py --mode zero_shot --seed 42 --tta --enhance --no_contrast --no_sharpen --bilateral_sc 100
 
 # 关闭颜色校正
 python infer.py --mode zero_shot --config configs/infer.yaml --seed 42 --no_color_correct
 
-# 调整颜色校正强度 (0=关闭, 1=全开, 默认0.8)
+# 调整颜色校正强度 (0=关闭, 1=全开, 默认0.3)
 python infer.py --mode zero_shot --config configs/infer.yaml --seed 42 --color_strength 0.6
+
+# 关闭LPIPS（更快，无需下载预训练模型）
+python infer.py --mode zero_shot --seed 42 --no_lpips
 
 # Stage-R-adapt 暂时舍弃（deprecated）
 ```
@@ -117,8 +128,11 @@ python train_all.py
 
 # 等待训练完成...
 
-# 运行推理评估（默认开启颜色校正）
-python infer.py --mode zero_shot --config configs/infer.yaml --seed 42
+# 推荐：TTA + 双边滤波
+python infer.py --mode zero_shot --seed 42 --tta --enhance --no_contrast --no_sharpen --bilateral_sc 100
+
+# 等待评估完成...
+# 输出4项指标：PSNR / SSIM / MAE / LPIPS
 ```
 
 ### 快速迭代

@@ -5,26 +5,31 @@
 已实现的评估功能包括：
 
 1. **时间戳输出目录** - 每次推理自动创建带时间戳的新目录，避免覆盖
-2. **逐图指标记录** - 每张图片的 PSNR/SSIM/LPIPS 指标单独保存
+2. **逐图指标记录** - 每张图片的 PSNR/SSIM/MAE/LPIPS 指标单独保存
 3. **统计分析** - 包含均值、标准差、中位数、最大/最小值、最差10%平均值
 4. **多种子稳定性评估** - 测试不同随机种子下的模型稳定性
 5. **逐图增益分布** - 分析每张图片在不同种子下的指标方差
+6. **TTA (Test-Time Augmentation)** - 4折翻转集成推理
+7. **后处理管线** - 双边滤波/自动对比度/锐化
 
 ## 使用方法
 
 ### 1. 单次推理评估
 
 ```bash
-# 基础评估（PSNR + SSIM），默认开启灰度世界颜色校正
+# 基础评估（PSNR + SSIM + MAE + LPIPS），默认开启灰度世界颜色校正
 python infer.py --mode zero_shot --config configs/infer.yaml --seed 42
 
-# 添加 LPIPS 评估（需要网络下载预训练模型）
-python infer.py --mode zero_shot --config configs/infer.yaml --seed 42 --compute_lpips
+# 推荐：TTA + 双边滤波（最佳质量）
+python infer.py --mode zero_shot --seed 42 --tta --enhance --no_contrast --no_sharpen --bilateral_sc 100
+
+# 关闭 LPIPS（更快，无需下载预训练模型）
+python infer.py --mode zero_shot --config configs/infer.yaml --seed 42 --no_lpips
 
 # 关闭颜色校正
 python infer.py --mode zero_shot --config configs/infer.yaml --seed 42 --no_color_correct
 
-# 调整颜色校正强度 (0=关闭, 1=全开, 默认0.8)
+# 调整颜色校正强度 (0=关闭, 1=全开, 默认0.3)
 python infer.py --mode zero_shot --config configs/infer.yaml --seed 42 --color_strength 0.6
 
 # adapt 模式评估 (deprecated)
@@ -39,9 +44,9 @@ python infer.py --mode adapt --config configs/infer.yaml --seed 123
 
 **CSV 格式示例：**
 ```csv
-image_name,psnr,ssim,lpips
-low00690.png,9.0058,0.3532,0.1234
-low00691.png,9.0024,0.3526,0.1456
+image_name,psnr,ssim,mae,lpips
+low00690.png,9.0058,0.3532,0.1456,0.2345
+low00691.png,9.0024,0.3526,0.1478,0.2401
 ...
 ```
 
@@ -54,8 +59,11 @@ python eval_multi_seed.py --mode zero_shot --config configs/infer.yaml
 # 自定义种子
 python eval_multi_seed.py --mode zero_shot --seeds 42 123 456 --config configs/infer.yaml
 
-# 包含 LPIPS 评估
-python eval_multi_seed.py --mode adapt --seeds 42 123 --compute_lpips --config configs/infer.yaml
+# 包含 LPIPS 评估（默认已开启）
+python eval_multi_seed.py --mode adapt --seeds 42 123 --config configs/infer.yaml
+
+# 关闭 LPIPS 评估
+python eval_multi_seed.py --mode zero_shot --seeds 42 123 --no_lpips --config configs/infer.yaml
 ```
 
 **输出文件：**
@@ -76,7 +84,9 @@ low00690.png,9.0058,0.0012,9.0045,9.0070,0.3532,0.0001,0.3531,0.3533
 ### 单张图片指标
 - **PSNR** (峰值信噪比): 越高越好，单位 dB
 - **SSIM** (结构相似度): 0-1 之间，越高越好
-- **LPIPS** (感知相似度): 越低越好（需要额外安装：`pip install lpips`）
+- **MAE** (平均绝对误差): 0-1 之间，越低越好
+- **LPIPS** (感知相似度): 越低越好（默认开启，用 `--no_lpips` 关闭）
+  - 注意：部分论文报告 LPIPS ×10 的值（如 0.122 显示为 "1.22"），本项目使用标准尺度
 
 ### 统计指标
 - **Mean**: 平均值
@@ -143,14 +153,14 @@ python infer.py --mode adapt --seed 42 --config configs/infer.yaml
 ## 注意事项
 
 ### LPIPS 使用
-LPIPS 需要下载预训练的 AlexNet 模型（~200MB），首次使用时会自动下载。如果网络不稳定：
+LPIPS 默认开启，首次运行时会自动下载 AlexNet 预训练模型（~200MB）。如果网络不稳定：
 ```bash
 # 方案1：手动下载并放置到缓存目录
 # 下载地址：https://download.pytorch.org/models/alexnet-owt-7be5be79.pth
 # 放置位置：~/.cache/torch/hub/checkpoints/
 
-# 方案2：暂时跳过 LPIPS
-python infer.py --mode zero_shot --config configs/infer.yaml  # 不加 --compute_lpips
+# 方案2：关闭 LPIPS
+python infer.py --mode zero_shot --config configs/infer.yaml --no_lpips
 ```
 
 ### 随机种子说明

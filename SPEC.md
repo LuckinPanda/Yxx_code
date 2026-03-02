@@ -236,9 +236,10 @@ This forces the network to predict missing reflectance from **neighbors only**,
 and by the Noise2Self theorem the optimal prediction converges to the
 clean signal rather than the noisy input.
 
-**Key design choices (v2)**:
-- 100% masked input (no 50% full-input mode which caused identity-mapping / noise retention)
-- Mask probability \(p = 0.3\) (increased from 0.2 for stronger denoising signal)
+**Key design choices (v3)**:
+- Mixed training: `full_input_ratio = 0.5` — 50% masked input (Noise2Self signal),
+  50% full input (bridges the train-test gap since inference uses unmasked `P_ref`)
+- Mask probability \(p = 0.2\) (balanced between self-supervised signal strength and training stability)
 
 ---
 
@@ -269,13 +270,17 @@ without requiring a clean reference image.
 
 ### 6.5 Training Mechanism Clarification
 
-- Masking is **always** applied to the input reflectance proxy.
-- Loss is computed **only** on masked pixels.
+- **Mixed-input training**: with probability `full_input_ratio` (default 0.5),
+  the full (unmasked) `P_ref` is used as input; otherwise the masked `P_tilde` is used.
+  - Masked-input batches: loss computed **only** on masked pixels (Noise2Self).
+  - Full-input batches: loss computed on all pixels (helps bridge train-test gap).
 - No paired clean image is used for denoising supervision.
 - Illumination branch remains frozen.
 - AdaReNet structure remains unchanged.
-- **No** `gradient_loss(pred, target)` or `color_consistency_loss(pred, target)`
-  against noisy \(P_{ref}\) (these were removed as they forced noise retention).
+- **Data augmentation**: random horizontal / vertical flips. Rotation augmentation
+  is redundant with RotEqBlock and therefore omitted.
+- **Gradient clipping**: `max_norm = 1.0` for training stability.
+- **AMP** (Automatic Mixed Precision) enabled on CUDA for ~1.5-2× speedup.
 
 The masking mechanism is used strictly as a self-supervised signal,
 and does not alter the inference architecture.
@@ -299,12 +304,17 @@ and does not alter the inference architecture.
 - Data: source-domain low-only images
 - Frozen: illumination network
 - Trainable: AdaReNet
-- Epochs: 30
-- Loss: \(\mathcal{L}_{ss} + \lambda_{tv} \mathcal{L}_{tv} + \lambda_{cb} \mathcal{L}_{cb} + \lambda_{\delta} \|\Delta\|_1\)
+- Epochs: **40** (increased from 30 for convergence with augmentation)
+- Learning rate: `1e-4` (Adam, constant; CosineAnnealing optional but harmful for this scale)
+- **Data augmentation**: random horizontal / vertical flip (configurable via `augment` flag)
+- **Gradient clipping**: `max_norm = 1.0`
+- **AMP**: mixed precision on CUDA
+- **Pre-caching**: frozen illumination outputs (L_e, P_ref) pre-computed once before training
+- Loss: \(\mathcal{L}_{ss} + \lambda_{grad} \mathcal{L}_{grad} + \lambda_{color} \mathcal{L}_{color} + \lambda_{\delta} \|\Delta\|_1\)
   - \(\mathcal{L}_{ss}\): Noise2Self masked-pixel-only inpainting loss (§6.3)
-  - \(\mathcal{L}_{tv}\): TV smoothness on recovered reflectance (\(\lambda_{tv} = 0.05\))
-  - \(\mathcal{L}_{cb}\): channel balance prior / gray-world (\(\lambda_{cb} = 0.1\))
-  - \(\|\Delta\|_1\): mild residual regularisation (\(\lambda_{\delta} = 0.05\))
+  - \(\mathcal{L}_{grad}\): gradient-domain L1 loss for edge preservation (\(\lambda_{grad} = 0.1\))
+  - \(\mathcal{L}_{color}\): channel-ratio color consistency (\(\lambda_{color} = 0.5\))
+  - \(\|\Delta\|_1\): mild residual regularisation (\(\lambda_{\delta} = 0.15\))
 - Output: `denoise_pre_ckpt.pth`
 
 ---
@@ -320,13 +330,57 @@ and does not alter the inference architecture.
 
 - Inference uses the pretrained AdaReNet weights \(\theta_F^{pre}\) (zero-shot only).
 - The forward pipeline is identical to training-time construction.
-- **Post-processing**: Gray-world color correction is applied to the output:
-  \[
-  \hat{I}_{corrected}(c) = \hat{I}(c) \cdot \frac{\bar{\mu}}{\mu_c + \epsilon}
-  \]
-  where \(\mu_c\) is the per-channel mean and \(\bar{\mu}\) is the global mean.
-  - Strength parameter (default 0.8) blends between original and corrected output.
-  - Can be disabled with `--no_color_correct` CLI flag.
+
+### 8.1 Test-Time Augmentation (TTA)
+
+- **4-fold flip ensemble**: original, horizontal flip, vertical flip, both flips.
+- Each augmented input is forward-passed, the output is inverse-transformed,
+  and the 4 predictions are averaged.
+- Enabled with `--tta` flag. Provides ~0.02 dB PSNR gain.
+
+### 8.2 Post-Processing Pipeline
+
+Enabled with `--enhance` flag. Applied in order:
+
+1. **Bilateral filter** (default on): OpenCV bilateral filter for noise removal
+   while preserving edges. `--bilateral_sc` controls `sigmaColor` (default 100).
+   Disable with `--no_bilateral`.
+2. **Auto-contrast** (default off via `--no_contrast`): percentile-based contrast
+   stretching. Harmful alone as it changes brightness distribution.
+3. **Unsharp mask** (default off via `--no_sharpen`): Gaussian-based sharpening.
+   Can amplify noise; use only after bilateral denoising.
+
+Recommended combination: `--enhance --no_contrast --no_sharpen --bilateral_sc 100`
+
+### 8.3 Gray-World Color Correction
+
+\[
+\hat{I}_{corrected}(c) = \hat{I}(c) \cdot \frac{\bar{\mu}}{\mu_c + \epsilon}
+\]
+
+where \(\mu_c\) is the per-channel mean and \(\bar{\mu}\) is the global mean.
+- Strength parameter (default **0.3**) blends between original and corrected output.
+- Can be disabled with `--no_color_correct` CLI flag.
+
+### 8.4 Illumination Smoothing
+
+- Optional Gaussian smoothing of \(L_T\) before adjustment (`--smooth_illum <sigma>`).
+- Reduces illumination non-uniformity artifacts in some scenes.
+
+### 8.5 Evaluation Metrics
+
+Four metrics are computed by default:
+
+| Metric | Range | Direction | Description |
+|--------|-------|-----------|-------------|
+| **PSNR** | 0–∞ dB | Higher is better | Peak Signal-to-Noise Ratio |
+| **SSIM** | 0–1 | Higher is better | Structural Similarity Index |
+| **MAE** | 0–1 | Lower is better | Mean Absolute Error |
+| **LPIPS** | 0–1 | Lower is better | Learned Perceptual Image Patch Similarity |
+
+- LPIPS is computed by default (disable with `--no_lpips`).
+- All four metrics are saved per-image in CSV and summarised in JSON.
+- Note: some papers report LPIPS ×10 (e.g. 0.122 displayed as "1.22").
 
 ---
 

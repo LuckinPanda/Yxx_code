@@ -4,3 +4,6 @@ pillow
 pyyaml
 tqdm
 numpy
+opencv-python
+scipy
+lpips
