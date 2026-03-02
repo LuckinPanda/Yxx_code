@@ -119,6 +119,11 @@ def compute_ssim(
     return ssim_map.mean()
 
 
+def compute_mae(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Compute Mean Absolute Error between pred and target."""
+    return torch.mean(torch.abs(pred - target))
+
+
 def compute_lpips(pred: torch.Tensor, target: torch.Tensor, lpips_model) -> float:
     """Compute LPIPS perceptual loss."""
     # LPIPS expects input in [-1, 1] range
@@ -148,45 +153,38 @@ def compute_statistics(metrics_list: list) -> dict:
     
     psnrs = [m['psnr'] for m in metrics_list]
     ssims = [m['ssim'] for m in metrics_list]
+    maes = [m['mae'] for m in metrics_list if 'mae' in m]
     lpips_values = [m['lpips'] for m in metrics_list if 'lpips' in m]
     
     # Sort for worst-case analysis
     psnrs_sorted = sorted(psnrs)
     ssims_sorted = sorted(ssims)
+    maes_sorted = sorted(maes, reverse=True) if maes else []
     lpips_sorted = sorted(lpips_values, reverse=True) if lpips_values else []
     
     # Compute worst 10%
     n_worst = max(1, int(len(psnrs) * 0.1))
     
+    def _metric_stats(values, sorted_vals, worst_high=True):
+        return {
+            'mean': float(np.mean(values)),
+            'std': float(np.std(values)),
+            'median': float(np.median(values)),
+            'min': float(np.min(values)),
+            'max': float(np.max(values)),
+            'worst_10pct_mean': float(np.mean(sorted_vals[:n_worst])),
+        }
+    
     stats = {
         'count': len(metrics_list),
-        'psnr': {
-            'mean': np.mean(psnrs),
-            'std': np.std(psnrs),
-            'median': np.median(psnrs),
-            'min': np.min(psnrs),
-            'max': np.max(psnrs),
-            'worst_10pct_mean': np.mean(psnrs_sorted[:n_worst]),
-        },
-        'ssim': {
-            'mean': np.mean(ssims),
-            'std': np.std(ssims),
-            'median': np.median(ssims),
-            'min': np.min(ssims),
-            'max': np.max(ssims),
-            'worst_10pct_mean': np.mean(ssims_sorted[:n_worst]),
-        },
+        'psnr': _metric_stats(psnrs, psnrs_sorted),
+        'ssim': _metric_stats(ssims, ssims_sorted),
     }
     
+    if maes:
+        stats['mae'] = _metric_stats(maes, maes_sorted)
     if lpips_values:
-        stats['lpips'] = {
-            'mean': np.mean(lpips_values),
-            'std': np.std(lpips_values),
-            'median': np.median(lpips_values),
-            'min': np.min(lpips_values),
-            'max': np.max(lpips_values),
-            'worst_10pct_mean': np.mean(lpips_sorted[:n_worst]),  # worst = highest LPIPS
-        }
+        stats['lpips'] = _metric_stats(lpips_values, lpips_sorted)
     
     return stats
 
@@ -304,7 +302,7 @@ def main() -> None:
     parser.add_argument("--mode", type=str, choices=["zero_shot", "adapt"], default="zero_shot")
     parser.add_argument("--disable_adarenet", action="store_true", help="Bypass AdaReNet (delta=0) for debugging")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
-    parser.add_argument("--compute_lpips", action="store_true", help="Compute LPIPS metric (requires lpips package)")
+    parser.add_argument("--no_lpips", action="store_true", help="Disable LPIPS metric computation")
     parser.add_argument("--no_color_correct", action="store_true", help="Disable gray-world color correction")
     parser.add_argument("--color_strength", type=float, default=0.3, help="Color correction strength (0=off, 1=full, default=0.3)")
     parser.add_argument("--tta", action="store_true", help="Enable Test-Time Augmentation (4x flip ensemble)")
@@ -338,9 +336,10 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Initialize LPIPS model if requested
+    # Initialize LPIPS model (enabled by default)
     lpips_model = None
-    if args.compute_lpips:
+    compute_lpips_flag = not args.no_lpips
+    if compute_lpips_flag:
         try:
             import lpips
             lpips_model = lpips.LPIPS(net='alex').to(device)
@@ -348,8 +347,8 @@ def main() -> None:
             print("[Infer] LPIPS model loaded (AlexNet backbone)")
         except ImportError:
             print("[Infer] WARNING: lpips package not found. Install with: pip install lpips")
-            print("[Infer] Skipping LPIPS computation")
-            args.compute_lpips = False
+            print("[Infer] LPIPS computation disabled")
+            compute_lpips_flag = False
 
     data_cfg = cfg["data"]
     resize = data_cfg["resize"]
@@ -498,15 +497,17 @@ def main() -> None:
                 
                 psnr = compute_psnr(pred, target).item()
                 ssim = compute_ssim(pred, target).item()
+                mae = compute_mae(pred, target).item()
                 
                 metric_dict = {
                     'image_name': name,
                     'psnr': psnr,
                     'ssim': ssim,
+                    'mae': mae,
                 }
                 
-                # Compute LPIPS if requested
-                if args.compute_lpips and lpips_model is not None:
+                # Compute LPIPS
+                if compute_lpips_flag and lpips_model is not None:
                     lpips_val = compute_lpips(pred, target, lpips_model)
                     metric_dict['lpips'] = lpips_val
                 
@@ -530,7 +531,7 @@ def main() -> None:
             'timestamp': timestamp,
             'seed': args.seed,
             'disable_adarenet': args.disable_adarenet,
-            'compute_lpips': args.compute_lpips,
+            'compute_lpips': compute_lpips_flag,
             'denoise_ckpt': denoise_ckpt,
         }
         json_path = out_dir / "metrics_summary.json"
@@ -553,6 +554,13 @@ def main() -> None:
         print(f"  Median:  {stats['ssim']['median']:.4f}")
         print(f"  Range:   [{stats['ssim']['min']:.4f}, {stats['ssim']['max']:.4f}]")
         print(f"  Worst 10%: {stats['ssim']['worst_10pct_mean']:.4f}")
+        
+        if 'mae' in stats:
+            print(f"\nMAE (lower is better):")
+            print(f"  Mean:    {stats['mae']['mean']:.4f} ± {stats['mae']['std']:.4f}")
+            print(f"  Median:  {stats['mae']['median']:.4f}")
+            print(f"  Range:   [{stats['mae']['min']:.4f}, {stats['mae']['max']:.4f}]")
+            print(f"  Worst 10%: {stats['mae']['worst_10pct_mean']:.4f}")
         
         if 'lpips' in stats:
             print(f"\nLPIPS (lower is better):")
