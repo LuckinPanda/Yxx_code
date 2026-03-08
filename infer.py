@@ -15,6 +15,7 @@ from tqdm import tqdm
 
 from src.data.dataset import LowLightDataset
 from src.models.adarenet import AdaReNet
+from src.models.adarenet_v2 import AdaReNetV2Lite
 from src.models.illumination import IlluminationNet
 from src.models.retinex import RetinexAdaReNet
 from src.utils.config import load_config
@@ -119,11 +120,6 @@ def compute_ssim(
     return ssim_map.mean()
 
 
-def compute_mae(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """Compute Mean Absolute Error between pred and target."""
-    return torch.mean(torch.abs(pred - target))
-
-
 def compute_lpips(pred: torch.Tensor, target: torch.Tensor, lpips_model) -> float:
     """Compute LPIPS perceptual loss."""
     # LPIPS expects input in [-1, 1] range
@@ -153,38 +149,45 @@ def compute_statistics(metrics_list: list) -> dict:
     
     psnrs = [m['psnr'] for m in metrics_list]
     ssims = [m['ssim'] for m in metrics_list]
-    maes = [m['mae'] for m in metrics_list if 'mae' in m]
     lpips_values = [m['lpips'] for m in metrics_list if 'lpips' in m]
     
     # Sort for worst-case analysis
     psnrs_sorted = sorted(psnrs)
     ssims_sorted = sorted(ssims)
-    maes_sorted = sorted(maes, reverse=True) if maes else []
     lpips_sorted = sorted(lpips_values, reverse=True) if lpips_values else []
     
     # Compute worst 10%
     n_worst = max(1, int(len(psnrs) * 0.1))
     
-    def _metric_stats(values, sorted_vals, worst_high=True):
-        return {
-            'mean': float(np.mean(values)),
-            'std': float(np.std(values)),
-            'median': float(np.median(values)),
-            'min': float(np.min(values)),
-            'max': float(np.max(values)),
-            'worst_10pct_mean': float(np.mean(sorted_vals[:n_worst])),
-        }
-    
     stats = {
         'count': len(metrics_list),
-        'psnr': _metric_stats(psnrs, psnrs_sorted),
-        'ssim': _metric_stats(ssims, ssims_sorted),
+        'psnr': {
+            'mean': np.mean(psnrs),
+            'std': np.std(psnrs),
+            'median': np.median(psnrs),
+            'min': np.min(psnrs),
+            'max': np.max(psnrs),
+            'worst_10pct_mean': np.mean(psnrs_sorted[:n_worst]),
+        },
+        'ssim': {
+            'mean': np.mean(ssims),
+            'std': np.std(ssims),
+            'median': np.median(ssims),
+            'min': np.min(ssims),
+            'max': np.max(ssims),
+            'worst_10pct_mean': np.mean(ssims_sorted[:n_worst]),
+        },
     }
     
-    if maes:
-        stats['mae'] = _metric_stats(maes, maes_sorted)
     if lpips_values:
-        stats['lpips'] = _metric_stats(lpips_values, lpips_sorted)
+        stats['lpips'] = {
+            'mean': np.mean(lpips_values),
+            'std': np.std(lpips_values),
+            'median': np.median(lpips_values),
+            'min': np.min(lpips_values),
+            'max': np.max(lpips_values),
+            'worst_10pct_mean': np.mean(lpips_sorted[:n_worst]),  # worst = highest LPIPS
+        }
     
     return stats
 
@@ -210,6 +213,65 @@ def bilateral_denoise_np(img_np: np.ndarray, d: int = 9,
     img_u8 = (np.clip(img_np, 0, 1) * 255).astype(np.uint8)
     filtered = cv2.bilateralFilter(img_u8, d, sigma_color, sigma_space)
     return filtered.astype(np.float32) / 255.0
+
+
+def guided_filter_np(img_np: np.ndarray, radius: int = 8, eps: float = 0.01,
+                     guide: np.ndarray = None) -> np.ndarray:
+    """Guided filter: edge-preserving smoothing with better structure preservation.
+    
+    Unlike bilateral filter, guided filter can better preserve fine structures
+    and gradients while removing noise. Particularly effective for low-light
+    enhancement where we want to preserve texture details.
+    
+    Args:
+        img_np: [H,W,3] float32 in [0,1] - image to filter
+        radius: filter window radius (default 8, larger = smoother)
+        eps: regularization (default 0.01, smaller = sharper edges)
+        guide: optional guide image, if None uses img as guide
+    
+    Returns:
+        [H,W,3] float32 filtered image
+    """
+    from cv2 import ximgproc
+    
+    img_u8 = (np.clip(img_np, 0, 1) * 255).astype(np.uint8)
+    if guide is not None:
+        guide_u8 = (np.clip(guide, 0, 1) * 255).astype(np.uint8)
+    else:
+        guide_u8 = img_u8
+    
+    # Process each channel separately with grayscale guide
+    result = np.zeros_like(img_u8)
+    guide_gray = cv2.cvtColor(guide_u8, cv2.COLOR_RGB2GRAY)
+    for c in range(3):
+        result[:, :, c] = ximgproc.guidedFilter(
+            guide_gray, img_u8[:, :, c], radius, eps * 255**2
+        )
+    
+    return result.astype(np.float32) / 255.0
+
+
+def nlmeans_denoise_np(img_np: np.ndarray, h: float = 10,
+                       template_size: int = 7, search_size: int = 21) -> np.ndarray:
+    """Non-local means denoising: globally searches for similar patches.
+    
+    More aggressive denoising than bilateral filter, better at removing
+    color noise while preserving textures.
+    
+    Args:
+        img_np: [H,W,3] float32 in [0,1]
+        h: filter strength (higher = more smoothing, 10-15 for moderate noise)
+        template_size: patch size for comparison
+        search_size: search window size
+    
+    Returns:
+        [H,W,3] float32 denoised image
+    """
+    img_u8 = (np.clip(img_np, 0, 1) * 255).astype(np.uint8)
+    denoised = cv2.fastNlMeansDenoisingColored(
+        img_u8, None, h, h, template_size, search_size
+    )
+    return denoised.astype(np.float32) / 255.0
 
 
 def auto_contrast_np(img_np: np.ndarray, clip_pct: float = 1.0) -> np.ndarray:
@@ -280,14 +342,41 @@ def postprocess_tensor(img: torch.Tensor, bilateral: bool = True,
                        bilateral_d: int = 9, bilateral_sc: float = 30,
                        bilateral_ss: float = 9, contrast_pct: float = 1.0,
                        sharpen_sigma: float = 1.0,
-                       sharpen_strength: float = 0.3) -> torch.Tensor:
-    """Apply post-processing pipeline to [3,H,W] tensor in [0,1]."""
+                       sharpen_strength: float = 0.3,
+                       denoise_method: str = "bilateral",
+                       guided_radius: int = 8, guided_eps: float = 0.01,
+                       nlm_h: float = 10) -> torch.Tensor:
+    """Apply post-processing pipeline to [3,H,W] tensor in [0,1].
+    
+    Args:
+        img: Input image tensor
+        bilateral: Enable denoising (controlled by denoise_method)
+        denoise_method: "bilateral" | "guided" | "nlmeans" | "combo"
+            - bilateral: Fast edge-preserving smoothing
+            - guided: Better structure preservation
+            - nlmeans: Best at removing color noise
+            - combo: guided + bilateral for maximum quality
+        guided_radius: Radius for guided filter (default 8)
+        guided_eps: Regularization for guided filter (default 0.01)
+        nlm_h: Strength for non-local means (default 10)
+    """
     device = img.device
     img_np = img.cpu().numpy().transpose(1, 2, 0)  # [H,W,3]
+    
     if bilateral:
-        img_np = bilateral_denoise_np(img_np, d=bilateral_d,
-                                       sigma_color=bilateral_sc,
-                                       sigma_space=bilateral_ss)
+        if denoise_method == "bilateral":
+            img_np = bilateral_denoise_np(img_np, d=bilateral_d,
+                                           sigma_color=bilateral_sc,
+                                           sigma_space=bilateral_ss)
+        elif denoise_method == "guided":
+            img_np = guided_filter_np(img_np, radius=guided_radius, eps=guided_eps)
+        elif denoise_method == "nlmeans":
+            img_np = nlmeans_denoise_np(img_np, h=nlm_h)
+        elif denoise_method == "combo":
+            # Combined: guided filter first for structure, then mild bilateral
+            img_np = guided_filter_np(img_np, radius=guided_radius, eps=guided_eps)
+            img_np = bilateral_denoise_np(img_np, d=5, sigma_color=50, sigma_space=5)
+    
     if contrast:
         img_np = auto_contrast_np(img_np, clip_pct=contrast_pct)
     if sharpen:
@@ -302,7 +391,7 @@ def main() -> None:
     parser.add_argument("--mode", type=str, choices=["zero_shot", "adapt"], default="zero_shot")
     parser.add_argument("--disable_adarenet", action="store_true", help="Bypass AdaReNet (delta=0) for debugging")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
-    parser.add_argument("--no_lpips", action="store_true", help="Disable LPIPS metric computation")
+    parser.add_argument("--compute_lpips", action="store_true", help="Compute LPIPS metric (requires lpips package)")
     parser.add_argument("--no_color_correct", action="store_true", help="Disable gray-world color correction")
     parser.add_argument("--color_strength", type=float, default=0.3, help="Color correction strength (0=off, 1=full, default=0.3)")
     parser.add_argument("--tta", action="store_true", help="Enable Test-Time Augmentation (4x flip ensemble)")
@@ -317,10 +406,23 @@ def main() -> None:
                         help="Contrast stretch clip percentile (0-5)")
     parser.add_argument("--sharpen_strength", type=float, default=0.3,
                         help="Unsharp mask strength (0-1)")
+    # Advanced denoising methods
+    parser.add_argument("--denoise_method", type=str, default="bilateral",
+                        choices=["bilateral", "guided", "nlmeans", "combo"],
+                        help="Denoising method: bilateral|guided|nlmeans|combo (default: bilateral)")
+    parser.add_argument("--guided_radius", type=int, default=8,
+                        help="Guided filter radius (default 8, larger=smoother)")
+    parser.add_argument("--guided_eps", type=float, default=0.01,
+                        help="Guided filter regularization (default 0.01, smaller=sharper edges)")
+    parser.add_argument("--nlm_h", type=float, default=10,
+                        help="Non-local means strength (default 10, higher=more smoothing)")
     # Individual post-processing toggles (when --enhance is set)
     parser.add_argument("--no_bilateral", action="store_true", help="Disable bilateral denoising")
     parser.add_argument("--no_contrast", action="store_true", help="Disable contrast stretching")
     parser.add_argument("--no_sharpen", action="store_true", help="Disable unsharp mask")
+    # Model version
+    parser.add_argument("--model_version", type=str, default="v1", choices=["v1", "v2lite"],
+                        help="AdaReNet version: v1 (original) or v2lite (improved)")
     args = parser.parse_args()
 
     # Set random seed if specified
@@ -336,10 +438,9 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Initialize LPIPS model (enabled by default)
+    # Initialize LPIPS model if requested
     lpips_model = None
-    compute_lpips_flag = not args.no_lpips
-    if compute_lpips_flag:
+    if args.compute_lpips:
         try:
             import lpips
             lpips_model = lpips.LPIPS(net='alex').to(device)
@@ -347,8 +448,8 @@ def main() -> None:
             print("[Infer] LPIPS model loaded (AlexNet backbone)")
         except ImportError:
             print("[Infer] WARNING: lpips package not found. Install with: pip install lpips")
-            print("[Infer] LPIPS computation disabled")
-            compute_lpips_flag = False
+            print("[Infer] Skipping LPIPS computation")
+            args.compute_lpips = False
 
     data_cfg = cfg["data"]
     resize = data_cfg["resize"]
@@ -382,7 +483,13 @@ def main() -> None:
     )
 
     illum = IlluminationNet(base_channels=cfg["model"]["illumination_channels"])
-    adarenet = AdaReNet(base_channels=cfg["model"]["adarenet_channels"])
+    
+    # Select model version
+    if args.model_version == "v2lite":
+        adarenet = AdaReNetV2Lite(base_channels=cfg["model"]["adarenet_channels"])
+        print(f"[Infer] Using AdaReNetV2Lite ({sum(p.numel() for p in adarenet.parameters()):,} params)")
+    else:
+        adarenet = AdaReNet(base_channels=cfg["model"]["adarenet_channels"])
 
     illum_adjust_mode = cfg["constants"].get("illum_adjust_mode", "gamma")
     pref_max = cfg["constants"].get("pref_max", 5.0)
@@ -478,6 +585,10 @@ def main() -> None:
                     bilateral_sc=args.bilateral_sc,
                     contrast_pct=args.contrast_pct,
                     sharpen_strength=args.sharpen_strength,
+                    denoise_method=args.denoise_method,
+                    guided_radius=args.guided_radius,
+                    guided_eps=args.guided_eps,
+                    nlm_h=args.nlm_h,
                 )
 
             save_image(i_hat, str(out_dir / name))
@@ -497,17 +608,15 @@ def main() -> None:
                 
                 psnr = compute_psnr(pred, target).item()
                 ssim = compute_ssim(pred, target).item()
-                mae = compute_mae(pred, target).item()
                 
                 metric_dict = {
                     'image_name': name,
                     'psnr': psnr,
                     'ssim': ssim,
-                    'mae': mae,
                 }
                 
-                # Compute LPIPS
-                if compute_lpips_flag and lpips_model is not None:
+                # Compute LPIPS if requested
+                if args.compute_lpips and lpips_model is not None:
                     lpips_val = compute_lpips(pred, target, lpips_model)
                     metric_dict['lpips'] = lpips_val
                 
@@ -531,7 +640,7 @@ def main() -> None:
             'timestamp': timestamp,
             'seed': args.seed,
             'disable_adarenet': args.disable_adarenet,
-            'compute_lpips': compute_lpips_flag,
+            'compute_lpips': args.compute_lpips,
             'denoise_ckpt': denoise_ckpt,
         }
         json_path = out_dir / "metrics_summary.json"
@@ -554,13 +663,6 @@ def main() -> None:
         print(f"  Median:  {stats['ssim']['median']:.4f}")
         print(f"  Range:   [{stats['ssim']['min']:.4f}, {stats['ssim']['max']:.4f}]")
         print(f"  Worst 10%: {stats['ssim']['worst_10pct_mean']:.4f}")
-        
-        if 'mae' in stats:
-            print(f"\nMAE (lower is better):")
-            print(f"  Mean:    {stats['mae']['mean']:.4f} ± {stats['mae']['std']:.4f}")
-            print(f"  Median:  {stats['mae']['median']:.4f}")
-            print(f"  Range:   [{stats['mae']['min']:.4f}, {stats['mae']['max']:.4f}]")
-            print(f"  Worst 10%: {stats['mae']['worst_10pct_mean']:.4f}")
         
         if 'lpips' in stats:
             print(f"\nLPIPS (lower is better):")

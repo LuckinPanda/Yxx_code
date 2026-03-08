@@ -1,0 +1,23 @@
+data:
+  test_low_dir: /home/yannayanna/datasets/LOL/eval15/low
+  test_high_dir: /home/yannayanna/datasets/LOL/eval15/high
+  output_dir: outputs
+  resize: null
+  num_workers: 0
+
+model:
+  illumination_channels: 32
+  adarenet_channels: 32
+
+constants:
+  # Must be consistent across training and inference
+  omega: 15.0
+  tau: 0.1
+  eps: 0.000001
+  illum_adjust_mode: gamma
+  pref_max: 5.0
+
+ckpt:
+  illum_ckpt_path: checkpoints/illum_ckpt.pth
+  denoise_pre_ckpt_path: checkpoints/denoise_pre_ckpt_v6.pth
+  denoise_adapt_ckpt_path: checkpoints/denoise_adapt_ckpt.pth

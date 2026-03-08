@@ -1,0 +1,47 @@
+# Stage-R-pre V8 配置
+# 基于原始最佳权重 + 感知损失微调
+
+seed: 42
+
+constants:
+  omega: 15.0
+  tau: 0.1
+  eps: 1.0e-6
+  illum_adjust_mode: gamma
+  pref_max: 5.0
+
+noise:
+  sigma_min: 0.01
+  sigma_max: 0.05
+
+data:
+  mode: source_low_only
+  source_low_dir: /home/yannayanna/datasets/LOL/our485/low
+  source_high_dir: null
+  target_low_dir: null
+  resize: null
+  num_workers: 4
+
+model:
+  illumination_channels: 32
+  adarenet_channels: 32
+
+ckpt:
+  illum_ckpt_path: checkpoints/illum_ckpt.pth
+  denoise_ckpt_path: checkpoints/denoise_pre_ckpt.pth.bak_mar7  # 原始最佳权重
+
+train:
+  epochs: 15                   # 短期微调
+  batch_size: 8
+  lr: 0.00002                  # 低学习率
+  mask_prob: 0.2
+  log_interval: 50
+  save_interval: 3
+  save_dir: checkpoints
+  save_name: denoise_pre_ckpt.pth
+
+  # 损失权重
+  lambda_perceptual: 0.03     # 感知损失权重（低，避免过度改变）
+  lambda_grad: 0.1
+  lambda_color: 0.5
+  lambda_delta: 0.15

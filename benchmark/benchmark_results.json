@@ -1,0 +1,61 @@
+{
+  "timestamp": "2026-03-04T22:23:29.032537",
+  "dataset": "LOL eval15",
+  "num_images": 15,
+  "results": {
+    "HE": {
+      "PSNR": 14.229,
+      "SSIM": 0.4275,
+      "MAE": 0.1726,
+      "LPIPS": 0.592
+    },
+    "CLAHE": {
+      "PSNR": 9.1323,
+      "SSIM": 0.3587,
+      "MAE": 0.3372,
+      "LPIPS": 0.5029
+    },
+    "Gamma": {
+      "PSNR": 14.0258,
+      "SSIM": 0.6122,
+      "MAE": 0.198,
+      "LPIPS": 0.348
+    },
+    "MSR": {
+      "PSNR": 7.9273,
+      "SSIM": 0.4872,
+      "MAE": 0.3829,
+      "LPIPS": 0.6677
+    },
+    "Zero-DCE": {
+      "PSNR": 14.7971,
+      "SSIM": 0.5598,
+      "MAE": 0.186,
+      "LPIPS": 0.3352
+    },
+    "SCI": {
+      "PSNR": 14.784,
+      "SSIM": 0.523,
+      "MAE": 0.1912,
+      "LPIPS": 0.3393
+    },
+    "EnlightenGAN": {
+      "PSNR": 17.8934,
+      "SSIM": 0.7114,
+      "MAE": 0.1212,
+      "LPIPS": 0.3014
+    },
+    "Ours (Retinex-AdaReNet)": {
+      "PSNR": 17.9801,
+      "SSIM": 0.5025,
+      "MAE": 0.1199,
+      "LPIPS": 0.3712
+    },
+    "URetinex-Net++": {
+      "PSNR": 20.7897,
+      "SSIM": 0.8236,
+      "MAE": 0.0937,
+      "LPIPS": 0.1163
+    }
+  }
+}

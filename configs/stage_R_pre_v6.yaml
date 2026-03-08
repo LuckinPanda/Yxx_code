@@ -1,0 +1,45 @@
+seed: 42
+
+data:
+  mode: source_low_only
+  source_low_dir: /home/yannayanna/datasets/LOL/our485/low
+  source_high_dir: null
+  target_low_dir: null
+  resize: null
+  num_workers: 4
+
+train:
+  batch_size: 4
+  epochs: 30  # 更少的epochs, 仔细监控
+  lr: 0.0001  # 降低学习率
+  weight_decay: 0.0001
+  warmup_epochs: 3
+  log_interval: 50
+  mask_prob: 0.2  # 恢复原始mask比例
+  use_structured_mask: false  # 禁用结构化mask
+  save_dir: checkpoints
+  save_name: denoise_pre_ckpt_v6.pth
+  save_interval: 5
+  # Loss weights - 更保守的权重
+  lambda_delta: 0.15   # delta regularization
+  lambda_ssim: 0.1     # 降低SSIM权重（可能导致不稳定）
+  lambda_grad: 0.1     # multi-scale gradient
+  lambda_color: 0.5    # color consistency (保持原权重)
+
+model:
+  illumination_channels: 32
+  adarenet_channels: 32  # V2Lite会自动扩展
+
+constants:
+  omega: 15.0
+  tau: 0.1
+  eps: 0.000001
+  illum_adjust_mode: gamma
+  pref_max: 5.0
+
+noise:
+  sigma_min: 0.01
+  sigma_max: 0.05
+
+ckpt:
+  illum_ckpt_path: checkpoints/illum_ckpt.pth

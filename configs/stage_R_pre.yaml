@@ -10,19 +10,17 @@ data:
 
 train:
   batch_size: 4
-  epochs: 40
+  epochs: 100
   lr: 0.0001
   log_interval: 50
   mask_prob: 0.2
-  full_input_ratio: 0.5   # same as baseline
   save_dir: checkpoints
   save_name: denoise_pre_ckpt.pth
-  use_cosine_lr: false    # constant lr works better for this task size
-  augment: true           # random flip augmentation (rotation redundant with RotEqBlock)
+  save_interval: 20  # 每20轮保存一次
   # Loss weights
   lambda_delta: 0.15     # delta regularization
   lambda_grad: 0.1       # gradient preservation
-  lambda_color: 0.5      # color consistency (restored to baseline)
+  lambda_color: 0.5      # color consistency
 
 model:
   illumination_channels: 32
